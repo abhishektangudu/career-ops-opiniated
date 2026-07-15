@@ -59,10 +59,12 @@ const EXCLUDES = [
   // fork's new root files are excluded here instead. See docs/slack-bot.md
   // and docs/deploy.md.
   'server.mjs',
+  'server-actions.mjs',
   'sync-google.mjs',
   'generate-tailored-cv.mjs',
   'scrape-jd.mjs',
   'server.test.mjs',
+  'server-actions.test.mjs',
   'scrape-jd.test.mjs',
   'Dockerfile.server',
 ];

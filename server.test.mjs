@@ -219,6 +219,43 @@ test('routing: Slack-shaped body WITH a valid signature is accepted', async () =
   assert.equal(res.status, 200);
 });
 
+test('routing: Slack Events url_verification WITHOUT a valid signature is rejected (fail-closed)', async () => {
+  const body = JSON.stringify({ type: 'url_verification', challenge: 'abc123' });
+  const res = await request('/webhook', {
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  assert.equal(res.status, 401);
+});
+
+test('routing: Slack Events event_callback WITHOUT a valid signature is rejected (no unauth path to dispatcher)', async () => {
+  const body = JSON.stringify({
+    type: 'event_callback',
+    event: { type: 'app_mention', text: 'hi', channel: 'C1', ts: '1.1', user: 'U1' },
+  });
+  const res = await request('/webhook', {
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  assert.equal(res.status, 401);
+});
+
+test('routing: Slack Events url_verification WITH a valid signature echoes the challenge', async () => {
+  const ts = String(Math.floor(Date.now() / 1000));
+  const body = JSON.stringify({ type: 'url_verification', challenge: 'chal-xyz' });
+  const sig = slackSignature(body, ts, SLACK_SECRET);
+  const res = await request('/webhook', {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Slack-Request-Timestamp': ts,
+      'X-Slack-Signature': sig,
+    },
+    body,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).challenge, 'chal-xyz');
+});
+
 test('routing: Telegram wrong secret rejected', async () => {
   const body = JSON.stringify({ message: { chat: { id: 123 }, text: 'https://example.com' } });
   const res = await request('/webhook', {

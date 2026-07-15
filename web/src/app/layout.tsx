@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { inter, instrumentSerif, instrumentSerifItalic } from "@/lib/fonts";
 import { AppShell } from "@/components/app-shell";
+import { SwRegister } from "@/components/sw-register";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -9,6 +10,16 @@ export const metadata: Metadata = {
   // Home-screen / standalone (iOS): let our theme-color flow up to the status bar
   // + Dynamic Island; safe-area insets handle the layout.
   appleWebApp: { capable: true, statusBarStyle: "black-translucent", title: "career-ops" },
+  // PWA icons. Keep the crisp SVG for browser tabs; add PNG app icons for
+  // installed/home-screen contexts (Android manifest + iOS apple-touch-icon).
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512.png", sizes: "512x512", type: "image/png" },
+    ],
+    apple: "/apple-touch-icon.png",
+  },
 };
 
 export const viewport: Viewport = {
@@ -34,6 +45,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     >
       <body className="font-sans antialiased">
         <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+        <SwRegister />
         <AppShell>{children}</AppShell>
       </body>
     </html>

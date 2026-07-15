@@ -20,6 +20,18 @@ import {
 import { scrapeJobDescription } from './scrape-jd.mjs';
 import { generateTailoredCV } from './generate-tailored-cv.mjs';
 
+// Gemini API-key text generation (Decision 5b — same pattern as gemini-eval.mjs).
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// Server-side action dispatcher for the Slack co-pilot (Phase 3, Task 12).
+import {
+  dispatchEnvelopes,
+  hasPending,
+  isAffirmative,
+  confirmPending,
+  clearPending,
+} from './server-actions.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
@@ -46,6 +58,10 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 const SERVER_API_KEY = process.env.SERVER_API_KEY;
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Free-tier model shared with gemini-eval.mjs; overridable via env.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
 // Slack's anti-replay window: reject request timestamps older than 5 minutes.
 const SLACK_MAX_SKEW_SECONDS = 60 * 5;
@@ -229,6 +245,246 @@ function postToTelegram(chatId, textMessage) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: Post a message into a Slack thread via the Web API (chat.postMessage).
+// Used by the Events-API co-pilot (Task 11), which replies in-thread with the
+// bot token rather than a slash-command response_url. Returns a promise so the
+// dispatcher can await ordered posts.
+// ---------------------------------------------------------------------------
+function postToSlackThread(channel, threadTs, textMessage) {
+  return new Promise((resolvePromise) => {
+    if (!SLACK_BOT_TOKEN) {
+      console.warn('[slack] SLACK_BOT_TOKEN not set. Cannot post to thread.');
+      return resolvePromise(false);
+    }
+    if (!channel) {
+      console.warn('[slack] No channel to post to.');
+      return resolvePromise(false);
+    }
+    const payload = { channel, text: textMessage };
+    if (threadTs) payload.thread_ts = threadTs;
+    const data = JSON.stringify(payload);
+
+    const options = {
+      hostname: 'slack.com',
+      path: '/api/chat.postMessage',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Authorization': `Bearer ${SLACK_BOT_TOKEN}`,
+        'Content-Length': Buffer.byteLength(data),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let responseBody = '';
+      res.on('data', (chunk) => { responseBody += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(responseBody);
+          if (!parsed.ok) console.error('[slack] chat.postMessage error:', parsed.error);
+        } catch {
+          console.error('[slack] chat.postMessage: non-JSON response');
+        }
+        resolvePromise(true);
+      });
+    });
+    req.on('error', (err) => {
+      console.error('[slack] chat.postMessage failed:', err.message);
+      resolvePromise(false);
+    });
+    req.write(data);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Slack co-pilot (Events API) — Gemini reply bridge (Task 11)
+// ---------------------------------------------------------------------------
+
+// Slack resends an event on any non-200 / slow ACK. De-dupe on event_id (and
+// the retry header) so a redelivery never double-posts. Bounded to avoid
+// unbounded growth on a long-lived instance.
+const seenSlackEvents = new Set();
+const SEEN_EVENTS_MAX = 500;
+function alreadyProcessedSlackEvent(eventId) {
+  if (!eventId) return false;
+  if (seenSlackEvents.has(eventId)) return true;
+  seenSlackEvents.add(eventId);
+  if (seenSlackEvents.size > SEEN_EVENTS_MAX) {
+    // Drop the oldest ~half (insertion order) to cap memory.
+    const drop = Math.floor(SEEN_EVENTS_MAX / 2);
+    let i = 0;
+    for (const k of seenSlackEvents) {
+      seenSlackEvents.delete(k);
+      if (++i >= drop) break;
+    }
+  }
+  return false;
+}
+
+// System prompt for the Slack co-pilot. Adapted from the web assistant's
+// SYSTEM_PREAMBLE but SLACK-appropriate: no web-only UI framing, replies kept
+// short. The action envelopes it may emit are executed server-side by
+// server-actions.mjs (read-mostly allowlist); everything else is web-app-only.
+const SLACK_COPILOT_PROMPT = `You are the career-ops co-pilot — a proactive, friendly career assistant for a person who is actively job-hunting. You answer over Slack, so keep replies SHORT (a few sentences), plain, and useful. No markdown headers, no long dumps.
+
+You can DO a few things by emitting an ACTION ENVELOPE inside your reply. An envelope is ONE line, on its own line (never inside a code fence):
+<<act:ACTION_ID {"arg":"value"}>>
+The server parses the envelope and performs the action, then posts the result into this thread — so just say briefly what you're doing, then emit the envelope.
+
+ACTIONS AVAILABLE OVER SLACK:
+- evaluate {"url":"https://…"} — evaluate a SPECIFIC job posting URL (scores it A–F and tailors a CV). Only when you actually have a real URL from the user.
+- generatePdf {"n":"42"} — generate an ATS-optimized CV tailored to a already-evaluated application #42.
+- setStatus {"n":"42","status":"Applied"} — move a tracked application to a new state (the server will ask the user to confirm before writing). Canonical states: Evaluated, Applied, Responded, Interview, Offer, Rejected, Discarded, SKIP.
+
+Any other action (navigate, filter, apply, editing the profile, research, etc.) is only available in the web app — if the user asks for one, tell them to open the web app for that; do NOT emit an envelope for it.
+
+RULES: NEVER invent URLs. Spending actions cost the user tokens — only fire them when clearly asked or clearly useful. Answer general career questions directly, warmly, and briefly.`;
+
+/**
+ * Generate a co-pilot reply with the Gemini API-key path (reuses GEMINI_API_KEY,
+ * same @google/generative-ai pattern as gemini-eval.mjs). Returns the raw model
+ * text (envelopes intact — the caller strips + dispatches them). Injectable via
+ * the `gen` param so tests never touch the network.
+ *
+ * @param {string} userText - The user's message (mention stripped).
+ * @param {(prompt:string)=>Promise<string>} [gen] - Optional generator override.
+ * @returns {Promise<string>}
+ */
+async function generateCopilotReply(userText, gen) {
+  if (typeof gen === 'function') return await gen(userText);
+  if (!GEMINI_API_KEY) {
+    return "I can't reach my AI right now (GEMINI_API_KEY isn't set on the server).";
+  }
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({
+    model: GEMINI_MODEL,
+    generationConfig: { temperature: 0.5, maxOutputTokens: 1024 },
+  });
+  try {
+    const result = await model.generateContent([
+      { text: SLACK_COPILOT_PROMPT },
+      { text: `\n\nUser: ${userText}\nAssistant:` },
+    ]);
+    return result.response.text();
+  } catch (err) {
+    const sanitized = (err.message || '').split(GEMINI_API_KEY).join('[REDACTED]');
+    console.error('[copilot] Gemini error:', sanitized);
+    return "Sorry — I hit an error generating a reply. Try again in a moment.";
+  }
+}
+
+/**
+ * Build the action-dispatch ctx for a given Slack thread: wires the read-mostly
+ * runners (evaluate/generatePdf/setStatus) to the real pipeline + CLIs and keys
+ * the confirm-gate on channel+thread.
+ */
+function buildActionCtx({ channel, threadTs, baseUrl, userId, teamId }) {
+  const threadKey = `${channel}:${threadTs || channel}`;
+  return {
+    threadKey,
+    // Bind confirm-gated writes to the requesting Slack user/workspace so another
+    // user in a shared channel thread can't fire someone else's tracker write.
+    userId: userId || null,
+    teamId: teamId || null,
+    // evaluate {url} → run the Phase-1 pipeline, posting progress + result into
+    // the thread. Resolves once kicked off (the pipeline posts asynchronously).
+    runEvaluate: async (args) => {
+      runAsyncPipeline({
+        jdUrl: args.url,
+        jdText: '',
+        source: 'slack-thread',
+        responseTarget: { channel, threadTs },
+        baseUrl,
+      }).catch((err) => console.error('[copilot-evaluate] pipeline error:', err));
+      return { text: `⏳ Evaluating ${args.url} — I'll post the score here when it's ready.` };
+    },
+    // generatePdf {n} → tailor a CV for an already-evaluated application #n,
+    // using the stored report as the JD context.
+    runGeneratePdf: async (args) => runGeneratePdfForApp(args.n, baseUrl),
+    // setStatus runner is the module default (shells out to set-status.mjs) —
+    // no override needed here.
+  };
+}
+
+/**
+ * generatePdf runner: find report #n, tailor a CV from it, and return a link.
+ */
+async function runGeneratePdfForApp(n, baseUrl) {
+  try {
+    const num = String(n).trim().padStart(3, '0');
+    const reportsDir = join(__dirname, 'reports');
+    const files = existsSync(reportsDir)
+      ? readdirSync(reportsDir).filter((f) => f.startsWith(`${num}-`) && f.endsWith('.md'))
+      : [];
+    if (files.length === 0) {
+      return { text: `⚠️ I couldn't find an evaluation report for application #${n}. Evaluate it first.` };
+    }
+    const reportPath = join(reportsDir, files[0]);
+    const reportContent = readFileSync(reportPath, 'utf8');
+    const companyMatch = reportContent.match(/# Evaluation:\s*(.*?)\s*—/);
+    const roleMatch = reportContent.match(/# Evaluation:.*?—\s*(.*?)$/m);
+    const companyName = companyMatch ? companyMatch[1].trim() : 'Company';
+    const roleTitle = roleMatch ? roleMatch[1].trim() : 'Role';
+
+    const cvResults = await generateTailoredCV(reportContent, companyName, roleTitle);
+    let pdfLink = `${baseUrl}/output/${cvResults.pdfFilename}`;
+    if (STORAGE_BUCKET) {
+      try {
+        pdfLink = await uploadToGcsAndGetLink(cvResults.pdfFilename, cvResults.pdfPath, STORAGE_BUCKET);
+      } catch (gcsErr) {
+        console.warn('[gcs] generatePdf upload failed:', gcsErr.message);
+      }
+    } else if (DRIVE_FOLDER_ID) {
+      try {
+        pdfLink = await uploadToDriveAndGetLink(cvResults.pdfFilename, cvResults.pdfPath, DRIVE_FOLDER_ID);
+      } catch (driveErr) {
+        console.warn('[drive] generatePdf upload failed:', driveErr.message);
+      }
+    }
+    return { text: `📄 Tailored CV for #${n} (${companyName}): ${pdfLink}` };
+  } catch (err) {
+    console.error('[copilot-generatePdf] error:', err.message);
+    return { text: `❌ Could not generate the CV for #${n}: ${err.message}` };
+  }
+}
+
+/**
+ * Handle one Slack co-pilot event (app_mention / message.im) in the background:
+ * confirm-gate follow-ups first, else generate a reply, strip + dispatch
+ * envelopes, and post everything into the thread. `gen` is injectable for tests.
+ */
+async function handleCopilotEvent({ channel, threadTs, text, baseUrl, userId, teamId }, gen) {
+  const ctx = buildActionCtx({ channel, threadTs, baseUrl, userId, teamId });
+  const post = (msg) => postToSlackThread(channel, threadTs, msg);
+
+  const cleaned = (text || '').replace(/<@[A-Z0-9]+>/gi, '').trim();
+
+  // 1. Confirm-gate follow-up: if this thread has a pending write and the SAME
+  // user said "yes", execute it. A "yes" from a DIFFERENT user is ignored (the
+  // pending action stays for the rightful user). Any other message from the
+  // requester drops the pending action and falls through to a normal reply.
+  if (hasPending(ctx.threadKey, ctx)) {
+    if (isAffirmative(cleaned)) {
+      const result = await confirmPending(ctx.threadKey, ctx);
+      // mismatch: a different user tried to confirm — leave it pending, say nothing.
+      if (result && result.mismatch) return;
+      if (result) return post(result.text);
+    } else {
+      clearPending(ctx.threadKey, ctx);
+    }
+  }
+
+  // 2. Generate a reply, strip/hide envelopes, dispatch them server-side.
+  const raw = await generateCopilotReply(cleaned, gen);
+  const { visible, results } = await dispatchEnvelopes(raw, ctx);
+  if (visible) await post(visible);
+  for (const r of results) {
+    if (r && r.text) await post(r.text);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main Evaluation & Sync Pipeline
 // ---------------------------------------------------------------------------
 async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl }) {
@@ -402,6 +658,9 @@ async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl
 function sendResponse(source, target, message) {
   if (source === 'slack') {
     postToSlack(target, message);
+  } else if (source === 'slack-thread') {
+    // Events-API co-pilot: target is { channel, threadTs }; post via bot token.
+    postToSlackThread(target && target.channel, target && target.threadTs, message);
   } else if (source === 'telegram') {
     postToTelegram(target, message);
   } else {
@@ -463,6 +722,51 @@ app.post('/webhook', (req, res) => {
     if (provided !== SERVER_API_KEY) {
       return rejectUnauthorized(res, 'Rejecting direct API request: API key mismatch.');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Slack Events API (Task 11). Events are JSON, so they came through the same
+  // fail-closed HMAC path above (isSlackShapedBody matches `type`). Handle the
+  // url_verification handshake and app_mention / message.im events here, BEFORE
+  // the slash-command / eval routing below.
+  // -------------------------------------------------------------------------
+  if (body.type === 'url_verification') {
+    // Answer Slack's one-time Request-URL challenge.
+    return res.status(200).json({ challenge: body.challenge });
+  }
+
+  if (body.type === 'event_callback') {
+    // ACK within 3s no matter what; process in the background.
+    res.status(200).send('OK');
+
+    // De-dupe Slack retries (X-Slack-Retry-Num header and/or event_id).
+    const retryNum = req.get('X-Slack-Retry-Num');
+    const eventId = body.event_id;
+    if (alreadyProcessedSlackEvent(eventId)) {
+      console.log(`[copilot] Skipping duplicate Slack event ${eventId} (retry ${retryNum || '0'}).`);
+      return;
+    }
+
+    const event = body.event || {};
+    // Only respond to human mentions / DMs — never to our own bot messages or
+    // message subtypes (edits, joins, bot_message) to avoid loops.
+    const isMention = event.type === 'app_mention';
+    const isDirectMessage = event.type === 'message' && event.channel_type === 'im';
+    const fromBot = !!event.bot_id || !!event.bot_profile || event.subtype === 'bot_message';
+    if ((isMention || isDirectMessage) && !fromBot && event.text) {
+      const channel = event.channel;
+      // Thread the reply: reuse the message's own thread if any, else start one
+      // rooted at this message (app_mention has no thread_ts on the first turn).
+      const threadTs = event.thread_ts || event.ts;
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+      const baseUrl = `${protocol}://${req.get('host')}`;
+      // Bind confirm-gated writes to the requester (user + workspace).
+      const userId = event.user || null;
+      const teamId = body.team_id || (event.team) || null;
+      handleCopilotEvent({ channel, threadTs, text: event.text, baseUrl, userId, teamId })
+        .catch((err) => console.error('[copilot] event handling error:', err));
+    }
+    return;
   }
 
   let jdUrl = '';
