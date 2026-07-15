@@ -62,6 +62,8 @@ const EXCLUDES = [
   'sync-google.mjs',
   'generate-tailored-cv.mjs',
   'scrape-jd.mjs',
+  'server.test.mjs',
+  'scrape-jd.test.mjs',
   'Dockerfile.server',
   'package-lock.json',
 ];
