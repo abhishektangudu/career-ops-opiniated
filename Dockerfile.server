@@ -4,8 +4,10 @@
 # (dev image, bind-mounts sources, ships the Go dashboard TUI + full TeXLive),
 # this image is SERVER-ONLY and lean:
 #   • COPY . . — the sources are baked in (no bind mount in the cloud).
-#   • npm ci  — install ALL deps (express, googleapis, playwright are runtime
-#               deps; do NOT use --omit=dev).
+#   • npm install — install ALL deps (express, googleapis, playwright are
+#               runtime deps; do NOT use --omit=dev). The root package-lock.json
+#               is gitignored upstream (only web/ ships one), so `npm ci` is not
+#               usable here — mirror the base Dockerfile and use `npm install`.
 #   • NO Go toolchain and NO TeXLive apt layer. The Slack pipeline produces PDFs
 #     via the HTML→PDF Playwright path (generate-pdf.mjs), NOT the LaTeX path,
 #     so the (large) TeX stack is intentionally omitted here. If you need the
@@ -37,11 +39,10 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# Install deps first (cached layer). Pin playwright to the version matching the
-# base image's bundled Chromium, mirroring the base Dockerfile.
-COPY package.json package-lock.json* ./
-RUN npm ci --no-audit --no-fund \
- && npm install --no-audit --no-fund --save-exact playwright@1.58.1
+# Install deps first (cached layer). package.json already pins playwright@1.61.1
+# to match the base image's bundled Chromium, so no extra pin step is needed.
+COPY package.json ./
+RUN npm install --no-audit --no-fund
 
 # Bake the sources in (respects .dockerignore: .env, node_modules, .git and
 # runtime data dirs are excluded; the .mjs sources, templates/, fonts/,

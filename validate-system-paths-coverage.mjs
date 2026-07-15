@@ -65,7 +65,6 @@ const EXCLUDES = [
   'server.test.mjs',
   'scrape-jd.test.mjs',
   'Dockerfile.server',
-  'package-lock.json',
 ];
 
 // Trees that live in the repo but deliberately OUTSIDE the updater's world:
