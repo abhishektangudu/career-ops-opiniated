@@ -10,12 +10,36 @@
 //      * navigations (HTML) -> network-first with a cached-shell fallback so a
 //                   fresh deploy is picked up immediately when online, and the
 //                   app still opens offline.
-//      * everything else (static assets) -> stale-while-revalidate-ish:
-//                   serve cache if present, otherwise network + cache.
+//      * immutable static assets (scripts/styles/images/fonts, /_next/static/*,
+//                   and our icons/manifest) -> cache-first, then network.
+//      * everything else (RSC/data payloads, and any non-allowlisted GET) ->
+//                   straight to network, never cache-first. This matters
+//                   because App Router client navigations / router.refresh()
+//                   fetch RSC/data payloads for routes that read the LIVE
+//                   local checkout (e.g. /pipeline); caching those would serve
+//                   a stale tracker/report even though /api/* is never cached.
 //
 // Bump CACHE_VERSION to force old caches out on the next activate.
 const CACHE_VERSION = "career-ops-v1";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
+
+// Only these paths are safe to cache-first — they're immutable/static and never
+// reflect live-checkout state.
+const STATIC_PATHS = new Set([
+  "/manifest.webmanifest",
+  "/apple-touch-icon.png",
+]);
+
+function isImmutableStatic(url, request) {
+  // Build assets are content-hashed and immutable.
+  if (url.pathname.startsWith("/_next/static/")) return true;
+  // Our PWA icons.
+  if (/^\/icon-.*\.png$/.test(url.pathname)) return true;
+  if (STATIC_PATHS.has(url.pathname)) return true;
+  // Classic static asset destinations (scripts/styles/images/fonts). Note:
+  // documents and "" (RSC/data fetches) are intentionally excluded.
+  return ["script", "style", "image", "font"].includes(request.destination);
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -71,17 +95,24 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static assets: cache-first, then network (and populate the cache).
-  event.respondWith(
-    caches.match(request).then((cached) => {
-      if (cached) return cached;
-      return fetch(request).then((response) => {
-        if (response && response.status === 200 && response.type === "basic") {
-          const copy = response.clone();
-          caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy));
-        }
-        return response;
-      });
-    })
-  );
+  // Immutable static assets: cache-first, then network (and populate cache).
+  if (isImmutableStatic(url, request)) {
+    event.respondWith(
+      caches.match(request).then((cached) => {
+        if (cached) return cached;
+        return fetch(request).then((response) => {
+          if (response && response.status === 200 && response.type === "basic") {
+            const copy = response.clone();
+            caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        });
+      })
+    );
+    return;
+  }
+
+  // Everything else (RSC/data payloads and any non-allowlisted GET): straight
+  // to network. No cache-first, no stale fallback — these may reflect the live
+  // local checkout.
 });
