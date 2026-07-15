@@ -53,6 +53,17 @@ const EXCLUDES = [
   'batch/logs/.gitkeep',
   'batch/tracker-additions/.gitkeep',
   'interview-prep/.gitkeep',
+  // Fork-only additions (Slack/Telegram remote-access server + its deploy image).
+  // These are NOT in upstream SYSTEM_PATHS/USER_PATHS by design — editing
+  // update-system.mjs (upstream-owned) would cause merge conflicts, so the
+  // fork's new root files are excluded here instead. See docs/slack-bot.md
+  // and docs/deploy.md.
+  'server.mjs',
+  'sync-google.mjs',
+  'generate-tailored-cv.mjs',
+  'scrape-jd.mjs',
+  'Dockerfile.server',
+  'package-lock.json',
 ];
 
 // Trees that live in the repo but deliberately OUTSIDE the updater's world:

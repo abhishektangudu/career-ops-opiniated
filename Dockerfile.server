@@ -1,0 +1,54 @@
+# career-ops — production server image (Slack/Telegram webhook bot)
+#
+# Runs server.mjs (Express) for remote access. Unlike the base `Dockerfile`
+# (dev image, bind-mounts sources, ships the Go dashboard TUI + full TeXLive),
+# this image is SERVER-ONLY and lean:
+#   • COPY . . — the sources are baked in (no bind mount in the cloud).
+#   • npm ci  — install ALL deps (express, googleapis, playwright are runtime
+#               deps; do NOT use --omit=dev).
+#   • NO Go toolchain and NO TeXLive apt layer. The Slack pipeline produces PDFs
+#     via the HTML→PDF Playwright path (generate-pdf.mjs), NOT the LaTeX path,
+#     so the (large) TeX stack is intentionally omitted here. If you need the
+#     LaTeX CV path, use the base Dockerfile instead.
+#
+# Base: Playwright image with Chromium preinstalled (matches the base Dockerfile).
+# server.mjs binds process.env.PORT || 8080 (Cloud Run injects PORT) and exposes
+# GET /healthz -> "OK" for health checks.
+#
+# Build:  docker build -f Dockerfile.server -t careerops-server .
+# Run:    docker run -p 8080:8080 -e GEMINI_API_KEY=... careerops-server
+# Health: curl localhost:8080/healthz  -> OK
+
+FROM mcr.microsoft.com/playwright:v1.61.1-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NODE_ENV=production \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PORT=8080
+
+# tini for clean signal handling / zombie reaping; git in case a git-commit-back
+# persistence option is enabled (see docs/deploy.md). No Go, no TeXLive.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates git tini; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps first (cached layer). Pin playwright to the version matching the
+# base image's bundled Chromium, mirroring the base Dockerfile.
+COPY package.json package-lock.json* ./
+RUN npm ci --no-audit --no-fund \
+ && npm install --no-audit --no-fund --save-exact playwright@1.58.1
+
+# Bake the sources in (respects .dockerignore: .env, node_modules, .git and
+# runtime data dirs are excluded; the .mjs sources, templates/, fonts/,
+# providers/, modes/ needed at runtime are included).
+COPY . .
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.mjs"]

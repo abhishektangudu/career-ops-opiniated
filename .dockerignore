@@ -9,8 +9,14 @@ jds/*
 !jds/.gitkeep
 reports/*.md
 .env
+.env.*
 .update-dismissed
 .update-lock
 *.log
 .DS_Store
 writing-samples
+# Never bake credentials into the image — Cloud Run uses ADC (the runtime
+# service account), so no key file is shipped. See docs/deploy.md.
+sa-key.json
+# Note: templates/, fonts/, providers/, modes/ are intentionally NOT excluded —
+# they are required at runtime by the Slack pipeline.
