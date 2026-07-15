@@ -377,6 +377,15 @@ function sendResponse(source, target, message) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: reject a request as unauthorized (logs the reason, sends 401).
+// Centralizes the fail-closed response so every auth path is identical.
+// ---------------------------------------------------------------------------
+function rejectUnauthorized(res, reason) {
+  console.warn(`[auth] ${reason}`);
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
+// ---------------------------------------------------------------------------
 // Webhook endpoint
 // ---------------------------------------------------------------------------
 app.post('/webhook', (req, res) => {
@@ -392,40 +401,34 @@ app.post('/webhook', (req, res) => {
     // header being present — an attacker could otherwise omit it and bypass
     // auth). Fail closed if the signing secret is unset.
     if (!SLACK_SIGNING_SECRET) {
-      console.warn('[auth] Rejecting Slack-shaped request: SLACK_SIGNING_SECRET is not set.');
-      return res.status(401).json({ error: 'Unauthorized' });
+      return rejectUnauthorized(res, 'Rejecting Slack-shaped request: SLACK_SIGNING_SECRET is not set.');
     }
     const timestamp = req.get('X-Slack-Request-Timestamp');
     const signature = req.get('X-Slack-Signature');
     if (!verifySlackSignature(req.rawBody, timestamp, signature, SLACK_SIGNING_SECRET)) {
-      console.warn('[auth] Rejecting Slack request: invalid or missing signature.');
-      return res.status(401).json({ error: 'Unauthorized' });
+      return rejectUnauthorized(res, 'Rejecting Slack request: invalid or missing signature.');
     }
   } else if (body.message && body.message.chat) {
     // Telegram: verify the secret token header. Fail closed if unset.
     if (!TELEGRAM_WEBHOOK_SECRET) {
-      console.warn('[auth] Rejecting Telegram request: TELEGRAM_WEBHOOK_SECRET is not set.');
-      return res.status(401).json({ error: 'Unauthorized' });
+      return rejectUnauthorized(res, 'Rejecting Telegram request: TELEGRAM_WEBHOOK_SECRET is not set.');
     }
     const provided = req.get('X-Telegram-Bot-Api-Secret-Token');
     if (provided !== TELEGRAM_WEBHOOK_SECRET) {
-      console.warn('[auth] Rejecting Telegram request: secret token mismatch.');
-      return res.status(401).json({ error: 'Unauthorized' });
+      return rejectUnauthorized(res, 'Rejecting Telegram request: secret token mismatch.');
     }
   } else if (body.url || body.text) {
     // Direct-JSON API: require X-Api-Key (or Bearer) == SERVER_API_KEY. Fail
     // closed if unset.
     if (!SERVER_API_KEY) {
-      console.warn('[auth] Rejecting direct API request: SERVER_API_KEY is not set.');
-      return res.status(401).json({ error: 'Unauthorized' });
+      return rejectUnauthorized(res, 'Rejecting direct API request: SERVER_API_KEY is not set.');
     }
     const apiKey = req.get('X-Api-Key');
     const authHeader = req.get('Authorization') || '';
     const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     const provided = apiKey || bearer;
     if (provided !== SERVER_API_KEY) {
-      console.warn('[auth] Rejecting direct API request: API key mismatch.');
-      return res.status(401).json({ error: 'Unauthorized' });
+      return rejectUnauthorized(res, 'Rejecting direct API request: API key mismatch.');
     }
   }
 
