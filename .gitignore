@@ -117,3 +117,6 @@ plan/
 
 # Web
 .career-ops-web/logo-cache/
+
+# Google Service Account keys
+sa-key.json
