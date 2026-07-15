@@ -40,7 +40,24 @@ docker push "$IMAGE"
 
 ## 2. Persistence — REQUIRED (do not skip)
 
-### Why this matters
+### The image is intentionally PII-free — inputs come at runtime
+
+`Dockerfile.server` bakes in only the **system** code + assets. Every private,
+user-layer input is excluded via `.dockerignore` (your `cv.md`,
+`config/profile.yml`, `config/cv-facts.json`, `modes/_profile.md`,
+`modes/_custom.md`, `voice-dna.md`, `portals.yml`, `article-digest.md`, and the
+`data/` `reports/` `output/` state). This is deliberate: it keeps the image
+clean so `docker build` from your real workspace can't leak PII into Artifact
+Registry.
+
+The flip side: those inputs must be **supplied at runtime**, or the bot won't
+produce real output. In particular `generate-tailored-cv.mjs` unconditionally
+reads `cv.md` (`PATHS.cv`) — **without it the tailored-CV step fails**. Profile-
+and voice-dependent prompts (`config/profile.yml`, `modes/_profile.md`,
+`modes/_custom.md`, `voice-dna.md`) degrade or fail similarly. So provisioning
+these at deploy time (section 2a below) is **required**, not optional.
+
+### Why persistence matters
 
 Cloud Run instances have an **ephemeral filesystem**. After a redeploy or a
 scale-to-zero restart, `data/`, `reports/`, and `output/` come back **empty**.
@@ -53,26 +70,71 @@ every previously-synced row from the Sheet** — worse than having no sync at al
 
 There are two layers of protection; **use both**:
 
-### (a) PRIMARY — mount a durable volume at `data/`, `reports/`, `output/`
+### (a) PRIMARY — provision the private inputs + state on a durable volume
 
-Mounting persistent storage at those three directories keeps the canonical
-files across restarts, so the code path is **identical to local** and the files
-stay canonical per the repo's data contract (`DATA_CONTRACT.md`). Pick one host:
+The volume serves **two** purposes: (1) it persists the **state** (`data/`,
+`reports/`, `output/`) across restarts so the code path is identical to local
+and files stay canonical per the data contract (`DATA_CONTRACT.md`), and (2) it
+supplies the **private input files** the image deliberately omits (`cv.md`,
+`config/profile.yml`, the user `modes/` files, `voice-dna.md`, etc.).
 
-**Cloud Run 2nd gen + GCS volume (gcsfuse):**
+**One-time: seed the state bucket with your private inputs.** Before first
+deploy, upload the input files from your local checkout to the paths the volume
+mounts expose (so the container finds them at `/app/cv.md`, `/app/config/…`,
+`/app/modes/_profile.md`, …):
+
+```bash
+STATE_BUCKET=your-state-bucket
+gsutil cp cv.md                 gs://$STATE_BUCKET/root/cv.md
+gsutil cp voice-dna.md          gs://$STATE_BUCKET/root/voice-dna.md
+gsutil cp portals.yml           gs://$STATE_BUCKET/root/portals.yml   # if used
+gsutil cp article-digest.md     gs://$STATE_BUCKET/root/article-digest.md  # if used
+gsutil cp config/profile.yml    gs://$STATE_BUCKET/config/profile.yml
+gsutil cp config/cv-facts.json  gs://$STATE_BUCKET/config/cv-facts.json    # if used
+gsutil cp modes/_profile.md     gs://$STATE_BUCKET/modes/_profile.md
+gsutil cp modes/_custom.md      gs://$STATE_BUCKET/modes/_custom.md        # if used
+# (data/applications.md etc. land under data/ as the bot writes them)
+```
+
+**Cloud Run 2nd gen + GCS volume (gcsfuse):** mount one GCS volume per state
+directory (`data/`, `reports/`, `output/`), and supply the individual private
+input files (`cv.md`, `config/profile.yml`, the user `modes/` files, etc.)
+separately via Secret Manager file mounts (see the note below) — this keeps the
+system files baked into `config/` and `modes/` intact:
 
 ```bash
 gcloud run deploy careerops-server \
   --image "$IMAGE" --region "$REGION" \
   --execution-environment gen2 \
-  --add-volume=name=careerops-data,type=cloud-storage,bucket=YOUR_STATE_BUCKET \
-  --add-volume-mount=volume=careerops-data,mount-path=/app/data \
-  --add-volume=name=careerops-reports,type=cloud-storage,bucket=YOUR_STATE_BUCKET \
-  --add-volume-mount=volume=careerops-reports,mount-path=/app/reports \
-  --add-volume=name=careerops-output,type=cloud-storage,bucket=YOUR_STATE_BUCKET \
-  --add-volume-mount=volume=careerops-output,mount-path=/app/output
-  # ...plus the flags from sections 3–5 below
+  # ── state (read-write, persisted) ──
+  --add-volume=name=co-data,type=cloud-storage,bucket=$STATE_BUCKET \
+  --add-volume-mount=volume=co-data,mount-path=/app/data \
+  --add-volume=name=co-reports,type=cloud-storage,bucket=$STATE_BUCKET \
+  --add-volume-mount=volume=co-reports,mount-path=/app/reports \
+  --add-volume=name=co-output,type=cloud-storage,bucket=$STATE_BUCKET \
+  --add-volume-mount=volume=co-output,mount-path=/app/output
+  # ...plus the private-input provisioning below and the flags from sections 3–5
 ```
+
+> Because `data/`, `reports/`, `output/` are their own directories, one GCS
+> volume each is clean. `config/` and `modes/` mix system + user files, so you
+> **cannot** mount a whole-directory volume over them (that would hide the system
+> assets baked into the image). Provision those user files one of two ways:
+>
+> - **Secret Manager (recommended for the small text inputs):** store `cv.md`,
+>   `config/profile.yml`, `modes/_profile.md`, `modes/_custom.md`,
+>   `voice-dna.md`, `article-digest.md`, `portals.yml` as secrets and mount each
+>   to its exact path, e.g.
+>   `--set-secrets=/app/cv.md=CAREEROPS_CV_MD:latest,/app/config/profile.yml=CAREEROPS_PROFILE_YML:latest,/app/modes/_profile.md=CAREEROPS_MODES_PROFILE:latest`.
+>   Secret file mounts land a single file at a path without masking sibling
+>   files, which is exactly what these mixed dirs need.
+> - **A tiny init step:** on container start, `gsutil cp` the input files from
+>   `gs://$STATE_BUCKET/...` into place (a wrapper entrypoint) — heavier, use
+>   only if you prefer everything in one bucket.
+>
+> Either way, the result is the same: `cv.md`, `config/profile.yml`, and the
+> user `modes/` files exist inside the running container, but were **never baked
+> into the image**.
 
 > **gcsfuse caveat:** GCS-FUSE is not a POSIX filesystem — no atomic renames,
 > weak concurrent-write consistency, and higher latency. Combined with
@@ -80,10 +142,17 @@ gcloud run deploy careerops-server \
 > personal tool, but do **not** run multiple concurrent writers against it.
 
 **Fly.io persistent volume (alternative host):** Fly gives you a real
-block-device volume. Attach one and mount the three dirs into it. **A Fly volume
-is single-instance** (it binds to one machine) — keep the app at one machine so
-there is exactly one writer. On Fly, ADC needs a key file (set
-`GOOGLE_APPLICATION_CREDENTIALS`), unlike Cloud Run.
+block-device volume. Attach one and mount `data/`, `reports/`, `output/` into it,
+and place the private input files (`cv.md`, `config/profile.yml`, the user
+`modes/` files, `voice-dna.md`, …) on the volume too (or in Fly secrets mounted
+to their paths). **A Fly volume is single-instance** (it binds to one machine) —
+keep the app at one machine so there is exactly one writer. On Fly, ADC needs a
+key file (set `GOOGLE_APPLICATION_CREDENTIALS`), unlike Cloud Run.
+
+> **Minimum to produce real output:** `cv.md` must exist in the running
+> container or `generate-tailored-cv.mjs` fails. Treat `cv.md` +
+> `config/profile.yml` + `modes/_profile.md` as the required input set; the rest
+> are optional but improve tailoring/voice.
 
 ### (b) DEFENSIVE — the empty-tracker guard (already in the code)
 
@@ -222,6 +291,8 @@ After `gcloud run deploy` prints the service URL (`https://careerops-server-….
   ```
 
 Verify: `curl https://<cloud-run-url>/healthz` → `OK`, then run
-`/careerops <real posting url>` from your phone. After a redeploy, confirm prior
+`/careerops <real posting url>` from your phone. Confirm a tailored CV comes
+back (proves `cv.md` and the profile inputs from section 2a are present in the
+container — the image doesn't ship them). After a redeploy, confirm prior
 evaluations are still present (Sheet rows intact, report/PDF files still in the
 mounted volume / Drive / GCS) — that's the Persistence guarantee from section 2.
