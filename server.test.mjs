@@ -24,7 +24,7 @@ process.env.SERVER_API_KEY = API_KEY;
 // the auth guard rejects before that, and 200-path requests below are shaped so
 // the pipeline runs in the background and is harmless / ignored).
 
-const { app, verifySlackSignature, isSlackShapedBody, buildEvalArgs } = await import('./server.mjs');
+const { app, verifySlackSignature, isSlackShapedBody, buildEvalArgs, parseReportFilenameFromStdout } = await import('./server.mjs');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,6 +37,10 @@ function slackSignature(rawBody, timestamp, secret) {
 // Start the imported Express app on an ephemeral port for HTTP-level tests.
 let server;
 let baseUrl;
+// In-process capture server standing in for a Slack response_url, so the
+// background pipeline's postToSlack() never makes a real outbound call.
+let slackCaptureServer;
+let slackCaptureUrl;
 test.before(async () => {
   await new Promise((resolvePromise) => {
     server = app.listen(0, () => {
@@ -45,9 +49,21 @@ test.before(async () => {
       resolvePromise();
     });
   });
+  await new Promise((resolvePromise) => {
+    slackCaptureServer = http.createServer((req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => res.writeHead(200).end('ok'));
+    });
+    slackCaptureServer.listen(0, '127.0.0.1', () => {
+      const { port } = slackCaptureServer.address();
+      slackCaptureUrl = `http://127.0.0.1:${port}/slack-response`;
+      resolvePromise();
+    });
+  });
 });
 test.after(async () => {
   if (server) await new Promise((r) => server.close(r));
+  if (slackCaptureServer) await new Promise((r) => slackCaptureServer.close(r));
 });
 
 function request(path, { method = 'POST', headers = {}, body = '' } = {}) {
@@ -150,6 +166,30 @@ test('buildEvalArgs: invokes evaluator WITHOUT --url', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Report discovery — parse the exact saved path from eval stdout (anti-race)
+// ---------------------------------------------------------------------------
+test('parseReportFilenameFromStdout: parses the exact saved report path', () => {
+  const stdout = [
+    '(some earlier eval output)',
+    '',
+    '✅  Report saved: reports/007-foo.md',
+    '📊  Tracker addition saved: batch/tracker-additions/007-foo.tsv',
+  ].join('\n');
+  // Must target the reported file, NOT the highest-numbered file on disk.
+  assert.equal(parseReportFilenameFromStdout(stdout), '007-foo.md');
+});
+
+test('parseReportFilenameFromStdout: tolerates a bare filename without reports/ prefix', () => {
+  assert.equal(parseReportFilenameFromStdout('Report saved: 012-bar.md'), '012-bar.md');
+});
+
+test('parseReportFilenameFromStdout: returns null when the line is absent (fallback)', () => {
+  assert.equal(parseReportFilenameFromStdout('no saved line here'), null);
+  assert.equal(parseReportFilenameFromStdout(''), null);
+  assert.equal(parseReportFilenameFromStdout(undefined), null);
+});
+
+// ---------------------------------------------------------------------------
 // HTTP-level auth routing (the bypass regression + Telegram/direct paths)
 // ---------------------------------------------------------------------------
 test('routing: Slack-shaped body WITHOUT a valid signature is rejected (bypass regression)', async () => {
@@ -163,7 +203,9 @@ test('routing: Slack-shaped body WITHOUT a valid signature is rejected (bypass r
 
 test('routing: Slack-shaped body WITH a valid signature is accepted', async () => {
   const ts = String(Math.floor(Date.now() / 1000));
-  const raw = 'command=%2Fcareerops&response_url=https%3A%2F%2Fhooks.slack.com%2Fx&text=hi';
+  // Point response_url at the in-process capture server so the background
+  // pipeline's Slack postback stays local (no real outbound network).
+  const raw = `command=%2Fcareerops&response_url=${encodeURIComponent(slackCaptureUrl)}&text=hi`;
   const sig = slackSignature(raw, ts, SLACK_SECRET);
   const res = await request('/webhook', {
     headers: {

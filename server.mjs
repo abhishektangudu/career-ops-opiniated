@@ -5,6 +5,7 @@ import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import https from 'https';
+import http from 'http';
 import crypto from 'crypto';
 
 // Import Google sync functions
@@ -104,6 +105,24 @@ export function isSlackShapedBody(body) {
 }
 
 /**
+ * Parse the exact saved report filename from gemini-eval.mjs stdout.
+ * gemini-eval.mjs prints `✅  Report saved: reports/{filename}` — consuming that
+ * exact file avoids a concurrency race where rediscovering "latest" by sorting
+ * reports/ could pick another overlapping request's freshly-created report.
+ *
+ * @param {string} stdout - The eval process stdout.
+ * @returns {string|null} The report filename (e.g. `007-foo.md`), or null if the
+ *   line can't be parsed (caller should fall back to sort-latest).
+ */
+export function parseReportFilenameFromStdout(stdout) {
+  if (!stdout || typeof stdout !== 'string') return null;
+  // Match `Report saved: reports/<filename>` tolerating the emoji/whitespace
+  // prefix and an optional leading `reports/` path segment.
+  const m = stdout.match(/Report saved:\s*(?:reports[/\\])?([^\s/\\]+\.md)\b/);
+  return m ? m[1] : null;
+}
+
+/**
  * Build the argv array for invoking gemini-eval.mjs.
  * IMPORTANT: gemini-eval.mjs has NO `--url` flag; any non-flag arg is treated as
  * JD text. So we pass ONLY the scraped JD text — never the URL (which would leak
@@ -139,8 +158,12 @@ function postToSlack(responseUrl, textMessage) {
   });
 
   const url = new URL(responseUrl);
+  // Slack response_url is always https in production; honor http for local,
+  // in-process test servers so the suite never needs real outbound network.
+  const transport = url.protocol === 'http:' ? http : https;
   const options = {
     hostname: url.hostname,
+    port: url.port || undefined,
     path: url.pathname + url.search,
     method: 'POST',
     headers: {
@@ -149,7 +172,7 @@ function postToSlack(responseUrl, textMessage) {
     }
   };
 
-  const req = https.request(options, (res) => {
+  const req = transport.request(options, (res) => {
     let responseBody = '';
     res.on('data', (chunk) => { responseBody += chunk; });
     res.on('end', () => {
@@ -246,12 +269,22 @@ async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl
 
       console.log('[eval] Evaluation completed successfully.');
 
-      // 3. Find the newly created report file
+      // 3. Identify the report this eval produced. Prefer the EXACT path the
+      // eval printed to stdout (`✅  Report saved: reports/<file>`) so overlapping
+      // requests can't pick each other's report. Fall back to sort-latest only
+      // if that line can't be parsed (defensive; e.g. output format changed).
       const reportsDir = join(__dirname, 'reports');
-      const files = readdirSync(reportsDir).filter(f => /^\d{3}-/.test(f));
-      files.sort((a, b) => b.localeCompare(a)); // Sort descending to get latest
-      const latestReport = files[0];
-      
+      let latestReport = parseReportFilenameFromStdout(stdout);
+      if (latestReport && !existsSync(join(reportsDir, latestReport))) {
+        console.warn(`[eval] Parsed report ${latestReport} not found on disk; falling back to sort-latest.`);
+        latestReport = null;
+      }
+      if (!latestReport) {
+        const files = readdirSync(reportsDir).filter(f => /^\d{3}-/.test(f));
+        files.sort((a, b) => b.localeCompare(a)); // Sort descending to get latest
+        latestReport = files[0];
+      }
+
       if (!latestReport) {
         sendResponse(source, responseTarget, `❌ Evaluation succeeded but no report file was found in reports/.`);
         return;
