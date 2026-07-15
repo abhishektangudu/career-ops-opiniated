@@ -1,9 +1,11 @@
+import 'dotenv/config';
 import express from 'express';
 import { execFile } from 'child_process';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import https from 'https';
+import crypto from 'crypto';
 
 // Import Google sync functions
 import { 
@@ -20,8 +22,13 @@ import { generateTailoredCV } from './generate-tailored-cv.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+
+// Capture the raw request bytes so we can compute the Slack HMAC over the exact
+// body Slack signed. The global body parsers consume the stream, so this
+// `verify` hook is the only reliable place to stash the bytes.
+const captureRawBody = (req, _res, buf) => { req.rawBody = buf; };
+app.use(express.json({ verify: captureRawBody }));
+app.use(express.urlencoded({ extended: true, verify: captureRawBody }));
 
 // Serve tailored CVs and reports statically
 app.use('/output', express.static(join(__dirname, 'output')));
@@ -32,6 +39,83 @@ const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 const DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const STORAGE_BUCKET = process.env.GOOGLE_STORAGE_BUCKET;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+// Auth secrets. Each auth path is independent and FAILS CLOSED: if the relevant
+// secret is unset, requests for that path are rejected (never accepted unsigned).
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
+const SERVER_API_KEY = process.env.SERVER_API_KEY;
+
+// Slack's anti-replay window: reject request timestamps older than 5 minutes.
+const SLACK_MAX_SKEW_SECONDS = 60 * 5;
+
+// ---------------------------------------------------------------------------
+// Auth helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify a Slack request signature per Slack's spec.
+ * Computes HMAC-SHA256(secret, `v0:{timestamp}:{rawBody}`) and timing-safe
+ * compares it to the provided `v0=<hex>` signature. Also enforces the anti-replay
+ * window on the timestamp. FAILS CLOSED: any missing input (secret, timestamp,
+ * signature, or body) returns false.
+ *
+ * @param {Buffer|string} rawBody - The exact raw request body bytes.
+ * @param {string} timestamp - The X-Slack-Request-Timestamp header (unix seconds).
+ * @param {string} signature - The X-Slack-Signature header (`v0=<hex>`).
+ * @param {string} secret - The Slack signing secret.
+ * @param {number} [now=Date.now()] - Current time in ms (injectable for tests).
+ * @returns {boolean} True only if the signature is valid and fresh.
+ */
+export function verifySlackSignature(rawBody, timestamp, signature, secret, now = Date.now()) {
+  if (!secret || !timestamp || !signature || rawBody == null) return false;
+
+  // Anti-replay: reject stale (or non-numeric) timestamps.
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) return false;
+  const nowSeconds = Math.floor(now / 1000);
+  if (Math.abs(nowSeconds - ts) > SLACK_MAX_SKEW_SECONDS) return false;
+
+  const body = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody);
+  const base = `v0:${timestamp}:${body}`;
+  const expected = 'v0=' + crypto.createHmac('sha256', secret).update(base, 'utf8').digest('hex');
+
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  const providedBuf = Buffer.from(String(signature), 'utf8');
+  if (expectedBuf.length !== providedBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, providedBuf);
+}
+
+/**
+ * Does a parsed request body look like a Slack request? True for slash commands
+ * (`command` + `response_url`) and future Events API payloads (a Slack `type`).
+ * Used to enforce Slack HMAC for ALL Slack-shaped requests so an attacker cannot
+ * bypass auth by omitting the signature header.
+ *
+ * @param {object} body - The parsed request body.
+ * @returns {boolean}
+ */
+export function isSlackShapedBody(body) {
+  if (!body || typeof body !== 'object') return false;
+  if (body.command && body.response_url) return true;
+  // Events API / interactivity payloads carry a Slack `type`.
+  if (typeof body.type === 'string' && body.type.length > 0) return true;
+  return false;
+}
+
+/**
+ * Build the argv array for invoking gemini-eval.mjs.
+ * IMPORTANT: gemini-eval.mjs has NO `--url` flag; any non-flag arg is treated as
+ * JD text. So we pass ONLY the scraped JD text — never the URL (which would leak
+ * into the evaluated text and pollute the eval).
+ *
+ * @param {string} evalScript - Absolute path to gemini-eval.mjs.
+ * @param {string} jdText - The scraped job description text.
+ * @returns {string[]} argv for execFile (excluding the node executable).
+ */
+export function buildEvalArgs(evalScript, jdText) {
+  return [evalScript, jdText];
+}
 
 // ---------------------------------------------------------------------------
 // Health check endpoints
@@ -146,11 +230,12 @@ async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl
     const updateMsg = `⏳ Job description loaded. Running Gemini evaluation...`;
     sendResponse(source, responseTarget, updateMsg);
 
-    // 2. Run gemini-eval.mjs
+    // 2. Run gemini-eval.mjs. gemini-eval.mjs has NO `--url` flag — any non-flag
+    // arg is treated as JD text — so pass ONLY the scraped JD text (finalJdText).
     const evalScript = join(__dirname, 'gemini-eval.mjs');
-    const args = jdUrl ? ['--url', jdUrl, finalJdText] : [finalJdText];
-    
-    execFile(process.execPath, [evalScript, ...args], { cwd: __dirname }, async (error, stdout, stderr) => {
+    const evalArgs = buildEvalArgs(evalScript, finalJdText);
+
+    execFile(process.execPath, evalArgs, { cwd: __dirname }, async (error, stdout, stderr) => {
       if (error) {
         console.error('[eval] Script error:', error.message);
         console.error('[eval] Script stdout:', stdout);
@@ -292,28 +377,58 @@ function sendResponse(source, target, message) {
 }
 
 // ---------------------------------------------------------------------------
-// Bulk CV Regeneration Endpoint
-// ---------------------------------------------------------------------------
-app.post('/bulk-regenerate', (req, res) => {
-  const days = parseInt(req.body.days, 10) || 3;
-  res.status(202).json({ message: `Bulk CV regeneration started in the background for the last ${days} days.` });
-
-  const scriptPath = join(__dirname, 'bulk-regenerate-cvs.mjs');
-  
-  execFile(process.execPath, [scriptPath, days.toString()], { cwd: __dirname }, (error, stdout, stderr) => {
-    if (error) {
-      console.error('[bulk-regenerate] Script error:', error.message);
-      console.error('[bulk-regenerate] Script stderr:', stderr);
-      return;
-    }
-    console.log('[bulk-regenerate] Script output:\n', stdout);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Webhook endpoint
 // ---------------------------------------------------------------------------
 app.post('/webhook', (req, res) => {
+  // -------------------------------------------------------------------------
+  // Authentication. Three INDEPENDENT paths, each FAILS CLOSED on a missing
+  // secret. Enforced BEFORE any body handling so unauthenticated requests never
+  // reach the pipeline.
+  // -------------------------------------------------------------------------
+  const body = req.body || {};
+
+  if (isSlackShapedBody(body)) {
+    // Slack: enforce HMAC for ALL Slack-shaped requests (do NOT gate on the
+    // header being present — an attacker could otherwise omit it and bypass
+    // auth). Fail closed if the signing secret is unset.
+    if (!SLACK_SIGNING_SECRET) {
+      console.warn('[auth] Rejecting Slack-shaped request: SLACK_SIGNING_SECRET is not set.');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const timestamp = req.get('X-Slack-Request-Timestamp');
+    const signature = req.get('X-Slack-Signature');
+    if (!verifySlackSignature(req.rawBody, timestamp, signature, SLACK_SIGNING_SECRET)) {
+      console.warn('[auth] Rejecting Slack request: invalid or missing signature.');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  } else if (body.message && body.message.chat) {
+    // Telegram: verify the secret token header. Fail closed if unset.
+    if (!TELEGRAM_WEBHOOK_SECRET) {
+      console.warn('[auth] Rejecting Telegram request: TELEGRAM_WEBHOOK_SECRET is not set.');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const provided = req.get('X-Telegram-Bot-Api-Secret-Token');
+    if (provided !== TELEGRAM_WEBHOOK_SECRET) {
+      console.warn('[auth] Rejecting Telegram request: secret token mismatch.');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  } else if (body.url || body.text) {
+    // Direct-JSON API: require X-Api-Key (or Bearer) == SERVER_API_KEY. Fail
+    // closed if unset.
+    if (!SERVER_API_KEY) {
+      console.warn('[auth] Rejecting direct API request: SERVER_API_KEY is not set.');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const apiKey = req.get('X-Api-Key');
+    const authHeader = req.get('Authorization') || '';
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const provided = apiKey || bearer;
+    if (provided !== SERVER_API_KEY) {
+      console.warn('[auth] Rejecting direct API request: API key mismatch.');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
   let jdUrl = '';
   let jdText = '';
   let source = 'direct';
@@ -385,11 +500,16 @@ app.post('/webhook', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Start the server
+// Start the server (only when run directly, not when imported by tests)
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
-  console.log(`🚀 Webhook server listening on port ${PORT}`);
-  console.log(`   Spreadsheet ID: ${SPREADSHEET_ID || 'Not set'}`);
-  console.log(`   GDrive Folder ID: ${DRIVE_FOLDER_ID || 'Not set'}`);
-  console.log(`   GCS Storage Bucket: ${STORAGE_BUCKET || 'Not set'}`);
-});
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Webhook server listening on port ${PORT}`);
+    console.log(`   Spreadsheet ID: ${SPREADSHEET_ID || 'Not set'}`);
+    console.log(`   GDrive Folder ID: ${DRIVE_FOLDER_ID || 'Not set'}`);
+    console.log(`   GCS Storage Bucket: ${STORAGE_BUCKET || 'Not set'}`);
+  });
+}
+
+export { app };
