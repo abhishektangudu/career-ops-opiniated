@@ -45,6 +45,11 @@ try {
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
+// Shared runtime-settings loader — supplies the INITIAL apiKey/modelName default
+// (env > config/runtime.json > unset) so a value saved from the PWA is picked up
+// by a freshly-spawned eval, while an explicit --model still overrides.
+import { resolveSetting } from './runtime-settings.mjs';
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -102,7 +107,9 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
 
 // Parse flags
 let jdText = '';
-let modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// Initial default via the shared loader (env > config/runtime.json > unset); an
+// explicit --model below still wins over this.
+let modelName = resolveSetting('geminiModel', { root: ROOT }) || 'gemini-2.5-flash';
 let saveReport = true;
 
 for (let i = 0; i < args.length; i++) {
@@ -130,7 +137,9 @@ if (!jdText) {
 // ---------------------------------------------------------------------------
 // Validate environment
 // ---------------------------------------------------------------------------
-const apiKey = process.env.GEMINI_API_KEY;
+// Resolve the key via the shared loader (env > config/runtime.json > unset) so a
+// key saved from the PWA is honored by a freshly-spawned eval.
+const apiKey = resolveSetting('geminiApiKey', { root: ROOT });
 if (!apiKey) {
   console.error(`
 ❌  GEMINI_API_KEY not found.

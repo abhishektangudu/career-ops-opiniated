@@ -62,6 +62,10 @@ writing-samples/*
 config/profile.yml
 config/cv-facts.json
 config/benchmarks.yml
+# Runtime settings written from the PWA (Gemini key + Google sync IDs). Runtime
+# source of truth locally; NEVER committed. On Cloud Run its path is redirected
+# via RUNTIME_SETTINGS_PATH (see docs/deploy.md).
+config/runtime.json
 portals.yml
 modes/_profile.md
 modes/_custom.md

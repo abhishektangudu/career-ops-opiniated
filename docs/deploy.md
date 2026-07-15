@@ -296,3 +296,98 @@ back (proves `cv.md` and the profile inputs from section 2a are present in the
 container — the image doesn't ship them). After a redeploy, confirm prior
 evaluations are still present (Sheet rows intact, report/PDF files still in the
 mounted volume / Drive / GCS) — that's the Persistence guarantee from section 2.
+
+---
+
+## 7. Runtime settings from the PWA (Integrations tab)
+career-ops is local-first and single-user. This doc covers the one cloud
+concern that the "Configurable Single-User PWA" feature adds: **where the
+PWA-written settings file lives on Cloud Run, and how env / Secret Manager /
+the file interact.**
+
+## What the PWA writes
+
+The Config → Integrations tab lets you set, at runtime (no redeploy):
+
+- `GEMINI_API_KEY` (secret) + `GEMINI_MODEL`
+- `GOOGLE_SPREADSHEET_ID`, `GOOGLE_DRIVE_FOLDER_ID`, `GOOGLE_STORAGE_BUCKET`
+
+These persist to a JSON file (`config/runtime.json` locally). Every consumer
+(`server.mjs`, `gemini-eval.mjs`) re-reads them **per invocation** through the
+shared loader `runtime-settings.mjs`, so a saved value takes effect without a
+restart of the process that reads it.
+
+## Precedence: env > file > unset
+
+```
+explicit env var   >   settings file (runtime.json)   >   unset
+```
+
+- Env-override preserves the deploy contract: Cloud Run / CI can pin a value
+  and it always wins.
+- The file lets you manage values from the UI.
+
+**Leave-env-unset requirement.** Because env shadows the file, if you keep
+`GEMINI_API_KEY` / `GOOGLE_*` set as Cloud Run env vars (for example the
+Secret-Manager-backed `GEMINI_API_KEY` some deploys wire in), those env values
+**shadow anything you save from the UI** — the UI save is written to the file
+but never surfaces. To manage a value from the PWA, **unset the matching env
+var on the service**.
+
+## Durable location on Cloud Run: `RUNTIME_SETTINGS_PATH`
+
+Cloud Run's filesystem is ephemeral, and `config/` **cannot be volume-mounted**
+(a mount there would hide the baked-in system assets under `config/`, and
+Secret Manager file mounts are read-only anyway). So on Cloud Run, redirect the
+settings file into the **already-mounted writable `data/` GCS volume** via:
+
+```
+RUNTIME_SETTINGS_PATH=/app/data/runtime.json
+```
+
+`settingsFilePath()` honors `RUNTIME_SETTINGS_PATH` and otherwise falls back to
+`<root>/config/runtime.json`. Pointing it inside the mounted `data/` volume is
+what makes the PWA-written settings **durable across instances/restarts**
+without mounting over `config/`.
+
+### gcsfuse caveat (non-atomic rename)
+
+The `data/` volume is a GCS bucket mounted via **gcsfuse**, which does **not**
+provide POSIX atomic renames. The web writer uses `atomicWriteWithBackup`
+(write a unique temp file, then `rename`) — on gcsfuse that temp+rename is
+**not guaranteed atomic**. This is acceptable for this tool because:
+
+- it is **single-user** and the service runs with `--concurrency=1`, so there
+  is a single writer — no concurrent-write race to lose;
+- the write is small and idempotent (a full re-serialize of the merged object),
+  and a `.bak-<ts>` snapshot is taken before each overwrite;
+- if a rename ever fails on gcsfuse, a **non-atomic direct overwrite** of the
+  target is an acceptable fallback for a personal single-user tool (worst case:
+  re-save from the UI).
+
+Run the service with `--concurrency=1` when relying on the file for writes.
+
+## Optional: Gemini-key write-through to Secret Manager
+
+When `SECRET_MANAGER_SECRET=projects/<project>/secrets/<name>` is set, a
+successful PWA save of the Gemini key **also** writes the key as a new Secret
+Manager version (base64 payload, via `googleapis` `secretmanager_v1`
+`projects.secrets.addVersion`). This is for **future deploys/restarts** that
+source the key from Secret Manager as an env var.
+
+- **Off by default** (only runs when the env flag is set).
+- **Non-blocking:** a write-through failure (e.g. `PERMISSION_DENIED`) is
+  surfaced in the verify result but never blocks the local file write.
+- **Does NOT hot-refresh a running instance.** A Secret-Manager-backed env var
+  is resolved at instance startup; writing a new version does not change the
+  env of an already-running instance. And remember: if that env var is set, it
+  **shadows** the file value (see precedence above). Treat the write-through as
+  "seed the value for the next cold start", not "update the live process".
+
+## Verify-before-save
+
+`POST /api/settings` server-side **verifies** the provided targets (a tiny live
+Gemini call + Drive/Sheet/GCS access checks under ADC, via the spawned
+`verify-google-access.mjs`) **before** persisting. An invalid key/ID is never
+written — even via a direct API call — and the submitted key is never echoed or
+logged.
