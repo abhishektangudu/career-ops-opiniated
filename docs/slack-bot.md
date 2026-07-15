@@ -97,7 +97,71 @@ returns `401`.
 
 ---
 
-## 4. Telegram (optional, same pipeline)
+## 4. Conversational co-pilot (Events API)
+
+Beyond the `/careerops` slash command, the bot can hold a conversation in a
+thread: `@career-ops` in a channel (or DM the bot) and it replies in-thread. It
+answers career questions and can run a small set of actions server-side
+(evaluate a posting, tailor a CV, or — with a confirm step — update a
+tracker status).
+
+### 4.1 Extra OAuth scopes
+
+In **OAuth & Permissions → Scopes → Bot Token Scopes**, add (on top of
+`commands`):
+
+- `chat:write` — post the threaded replies via the bot token.
+- `app_mentions:read` — receive `@career-ops` mentions.
+- `im:history` — read direct messages to the bot.
+
+After changing scopes you must **reinstall the app** (OAuth & Permissions →
+**Reinstall to Workspace**) and re-copy the Bot User OAuth Token if it changed
+(`SLACK_BOT_TOKEN`).
+
+### 4.2 Enable Event Subscriptions
+
+1. **Event Subscriptions** → toggle **Enable Events** on.
+2. **Request URL**: `https://<tunnel-or-host>/webhook` (the SAME endpoint as the
+   slash command). Slack sends a one-time `url_verification` challenge; the
+   server answers it automatically, so the URL should show **Verified** once the
+   server is reachable.
+3. **Subscribe to bot events**: add `app_mention` and `message.im`.
+4. **Save Changes**, then **reinstall** the app if prompted.
+
+The co-pilot generates replies with the Gemini API key (`GEMINI_API_KEY`, the
+same key the evaluation pipeline uses) and posts them into the thread with the
+bot token. It ACKs Slack within 3s and does the generation in the background,
+and de-dupes Slack's retries (`X-Slack-Retry-Num` / `event_id`) so a slow reply
+never double-posts.
+
+**Confirm-gated writes:** a `setStatus` request (e.g. "mark #42 applied") does
+NOT write immediately — the bot asks you to reply `yes` in the same thread
+first. That pending confirmation is held **in memory** on a single server
+instance: it is fine for a personal, single-instance deployment, but it does not
+survive a restart and is not shared across instances, so if the server redeploys
+between the prompt and your `yes` you'll need to re-issue the request.
+
+### 4.3 Verify
+
+From any channel the bot is in:
+
+```
+@career-ops hi
+```
+
+You should get a short threaded reply. Then try an action:
+
+```
+@career-ops evaluate https://boards.example.com/some-job-posting
+```
+
+The bot acknowledges and posts the score into the thread when the pipeline
+finishes. A `mark #42 applied` request prompts for a `yes` before it writes to
+the tracker.
+
+---
+
+## 5. Telegram (optional, same pipeline)
 
 The server also accepts Telegram webhook updates. Create a bot with
 [@BotFather](https://t.me/BotFather), set `TELEGRAM_BOT_TOKEN` and a random
