@@ -379,10 +379,14 @@ async function generateCopilotReply(userText, gen) {
  * runners (evaluate/generatePdf/setStatus) to the real pipeline + CLIs and keys
  * the confirm-gate on channel+thread.
  */
-function buildActionCtx({ channel, threadTs, baseUrl }) {
+function buildActionCtx({ channel, threadTs, baseUrl, userId, teamId }) {
   const threadKey = `${channel}:${threadTs || channel}`;
   return {
     threadKey,
+    // Bind confirm-gated writes to the requesting Slack user/workspace so another
+    // user in a shared channel thread can't fire someone else's tracker write.
+    userId: userId || null,
+    teamId: teamId || null,
     // evaluate {url} → run the Phase-1 pipeline, posting progress + result into
     // the thread. Resolves once kicked off (the pipeline posts asynchronously).
     runEvaluate: async (args) => {
@@ -450,18 +454,21 @@ async function runGeneratePdfForApp(n, baseUrl) {
  * confirm-gate follow-ups first, else generate a reply, strip + dispatch
  * envelopes, and post everything into the thread. `gen` is injectable for tests.
  */
-async function handleCopilotEvent({ channel, threadTs, text, baseUrl }, gen) {
-  const ctx = buildActionCtx({ channel, threadTs, baseUrl });
+async function handleCopilotEvent({ channel, threadTs, text, baseUrl, userId, teamId }, gen) {
+  const ctx = buildActionCtx({ channel, threadTs, baseUrl, userId, teamId });
   const post = (msg) => postToSlackThread(channel, threadTs, msg);
 
   const cleaned = (text || '').replace(/<@[A-Z0-9]+>/gi, '').trim();
 
-  // 1. Confirm-gate follow-up: if this thread has a pending write and the user
-  // said "yes", execute it. If they said something else, drop the pending
-  // action and fall through to a normal reply.
+  // 1. Confirm-gate follow-up: if this thread has a pending write and the SAME
+  // user said "yes", execute it. A "yes" from a DIFFERENT user is ignored (the
+  // pending action stays for the rightful user). Any other message from the
+  // requester drops the pending action and falls through to a normal reply.
   if (hasPending(ctx.threadKey, ctx)) {
     if (isAffirmative(cleaned)) {
       const result = await confirmPending(ctx.threadKey, ctx);
+      // mismatch: a different user tried to confirm — leave it pending, say nothing.
+      if (result && result.mismatch) return;
       if (result) return post(result.text);
     } else {
       clearPending(ctx.threadKey, ctx);
@@ -753,7 +760,10 @@ app.post('/webhook', (req, res) => {
       const threadTs = event.thread_ts || event.ts;
       const protocol = req.headers['x-forwarded-proto'] || req.protocol;
       const baseUrl = `${protocol}://${req.get('host')}`;
-      handleCopilotEvent({ channel, threadTs, text: event.text, baseUrl })
+      // Bind confirm-gated writes to the requester (user + workspace).
+      const userId = event.user || null;
+      const teamId = body.team_id || (event.team) || null;
+      handleCopilotEvent({ channel, threadTs, text: event.text, baseUrl, userId, teamId })
         .catch((err) => console.error('[copilot] event handling error:', err));
     }
     return;

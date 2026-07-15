@@ -28,8 +28,10 @@ import {
   isAffirmative,
   confirmPending,
   clearPending,
+  canonicalizeStatus,
   ALLOWED_ACTIONS,
-  WEB_ONLY_ACTIONS,
+  CANON_STATUS,
+  PENDING_TTL_MS,
 } from './server-actions.mjs';
 
 // ---------------------------------------------------------------------------
@@ -96,13 +98,11 @@ test('dispatchEnvelopes: skips a malformed-JSON envelope', async () => {
 // ---------------------------------------------------------------------------
 // (b) Read-mostly allowlist
 // ---------------------------------------------------------------------------
-test('allowlist sets are as designed', () => {
+test('allowlist is as designed', () => {
   assert.ok(ALLOWED_ACTIONS.has('evaluate'));
   assert.ok(ALLOWED_ACTIONS.has('generatePdf'));
   assert.ok(ALLOWED_ACTIONS.has('setStatus'));
   assert.ok(!ALLOWED_ACTIONS.has('navigate'));
-  assert.ok(WEB_ONLY_ACTIONS.has('navigate'));
-  assert.ok(WEB_ONLY_ACTIONS.has('setProfile'));
 });
 
 test('dispatchAction: evaluate runs its injected runner with a valid URL', async () => {
@@ -201,6 +201,104 @@ test('setStatus: confirm gate is per-thread (isolated pending maps)', async () =
   assert.ok(!hasPending('B:1', ctxB), 'thread B must not see thread A pending');
 });
 
+// --- numeric-n + status validation (review finding 3) ---------------------
+test('canonicalizeStatus: case-insensitive match, null for unknown', () => {
+  assert.equal(canonicalizeStatus('applied'), 'Applied');
+  assert.equal(canonicalizeStatus('  OFFER '), 'Offer');
+  assert.equal(canonicalizeStatus('skip'), 'SKIP');
+  assert.equal(canonicalizeStatus('bogus'), null);
+  assert.equal(canonicalizeStatus(undefined), null);
+  assert.ok(CANON_STATUS.includes('Applied'));
+});
+
+test('setStatus: rejects a non-numeric n (would be a company name to set-status.mjs) and stashes nothing', async () => {
+  const ctx = { pending: new Map(), threadKey: 'C4:T4' };
+  const res = await dispatchAction('setStatus', { n: 'Acme', status: 'Applied' }, ctx);
+  assert.match(res.text, /numeric application number/i);
+  assert.notEqual(res.confirm, true);
+  assert.ok(!hasPending('C4:T4', ctx), 'nothing should be stashed for a bad n');
+});
+
+test('setStatus: rejects an invalid status BEFORE stashing', async () => {
+  const ctx = { pending: new Map(), threadKey: 'C5:T5' };
+  const res = await dispatchAction('setStatus', { n: '42', status: 'YOLO' }, ctx);
+  assert.match(res.text, /isn't a valid status/i);
+  assert.ok(!hasPending('C5:T5', ctx));
+});
+
+test('setStatus: canonicalizes the status it stashes (applied → Applied)', async () => {
+  const pending = new Map();
+  let ranWith = null;
+  const ctx = { pending, threadKey: 'C6:T6', runSetStatus: async (a) => { ranWith = a; return { text: 'ok' }; } };
+  const res = await dispatchAction('setStatus', { n: '42', status: 'applied' }, ctx);
+  assert.equal(res.confirm, true);
+  assert.match(res.text, /\*Applied\*/);
+  await confirmPending('C6:T6', ctx);
+  assert.deepEqual(ranWith, { n: '42', status: 'Applied' });
+});
+
+// --- user binding (review finding 1) --------------------------------------
+test('setStatus: a DIFFERENT user cannot confirm (mismatch, pending left intact)', async () => {
+  const pending = new Map();
+  let ran = false;
+  const requester = { pending, threadKey: 'C7:T7', userId: 'UAAA', teamId: 'TEAM1', runSetStatus: async () => { ran = true; return { text: 'written' }; } };
+  await dispatchAction('setStatus', { n: '42', status: 'Applied' }, requester);
+
+  // Another user in the same thread replies "yes".
+  const intruder = { pending, threadKey: 'C7:T7', userId: 'UBBB', teamId: 'TEAM1', runSetStatus: async () => { ran = true; return { text: 'written' }; } };
+  const result = await confirmPending('C7:T7', intruder);
+  assert.deepEqual(result, { mismatch: true });
+  assert.equal(ran, false, 'intruder must NOT trigger the write');
+  assert.ok(hasPending('C7:T7', requester), 'pending stays for the rightful user');
+
+  // The original requester can still confirm.
+  const done = await confirmPending('C7:T7', requester);
+  assert.ok(done.executed);
+  assert.equal(ran, true);
+});
+
+test('setStatus: a different team cannot confirm even with a matching user id', async () => {
+  const pending = new Map();
+  let ran = false;
+  const requester = { pending, threadKey: 'C7b:T7b', userId: 'UAAA', teamId: 'TEAM1', runSetStatus: async () => { ran = true; return { text: 'x' }; } };
+  await dispatchAction('setStatus', { n: '9', status: 'Offer' }, requester);
+  const otherTeam = { pending, threadKey: 'C7b:T7b', userId: 'UAAA', teamId: 'TEAM2', runSetStatus: async () => { ran = true; return { text: 'x' }; } };
+  const result = await confirmPending('C7b:T7b', otherTeam);
+  assert.deepEqual(result, { mismatch: true });
+  assert.equal(ran, false);
+});
+
+// --- clobber refusal (review finding 2b) ----------------------------------
+test('setStatus: a second pending request in the same thread does NOT clobber the first', async () => {
+  const pending = new Map();
+  const ctx = { pending, threadKey: 'C8:T8', userId: 'UAAA', runSetStatus: async (a) => ({ text: `did ${a.n}=${a.status}` }) };
+  await dispatchAction('setStatus', { n: '42', status: 'Applied' }, ctx);
+  const second = await dispatchAction('setStatus', { n: '99', status: 'Rejected' }, ctx);
+  assert.match(second.text, /already have a pending confirmation/i);
+  assert.notEqual(second.confirm, true);
+  // The ORIGINAL action (#42 Applied) must still be the one that executes.
+  const done = await confirmPending('C8:T8', ctx);
+  assert.equal(done.text, 'did 42=Applied');
+});
+
+// --- TTL expiry (review finding 2a) ---------------------------------------
+test('setStatus: an expired pending action is not confirmable and frees the thread', async () => {
+  const pending = new Map();
+  const ctx = { pending, threadKey: 'C10:T10', userId: 'UAAA', runSetStatus: async () => ({ text: 'written' }) };
+  await dispatchAction('setStatus', { n: '42', status: 'Applied' }, ctx);
+  // Backdate the stored timestamp beyond the TTL.
+  const rec = pending.get('C10:T10');
+  rec.at = Date.now() - PENDING_TTL_MS - 1000;
+  assert.ok(!hasPending('C10:T10', ctx), 'expired pending should read as absent');
+  const result = await confirmPending('C10:T10', ctx);
+  assert.equal(result, null, 'expired pending must not execute');
+  assert.ok(!pending.has('C10:T10'), 'expired pending should be evicted');
+
+  // After expiry, a fresh request is accepted (thread is free, no clobber msg).
+  const fresh = await dispatchAction('setStatus', { n: '7', status: 'Offer' }, ctx);
+  assert.equal(fresh.confirm, true);
+});
+
 test('isAffirmative: accepts common yeses, rejects everything else', () => {
   for (const y of ['yes', 'Yes', 'YES', 'y', 'confirm', 'yep', 'ok', 'okay!', 'yeah.']) {
     assert.ok(isAffirmative(y), `"${y}" should be affirmative`);
@@ -214,6 +312,6 @@ test('setStatus: missing args are rejected before anything is stashed', async ()
   const pending = new Map();
   const ctx = { pending, threadKey: 'C3:T3' };
   const res = await dispatchAction('setStatus', { n: '', status: '' }, ctx);
-  assert.match(res.text, /needs an application number and a status/i);
+  assert.match(res.text, /numeric application number/i);
   assert.ok(!hasPending('C3:T3', ctx));
 });

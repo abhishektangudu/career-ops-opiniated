@@ -129,27 +129,32 @@ export function stripEnvelopes(text) {
 // Action allowlist
 // ---------------------------------------------------------------------------
 
-/** Actions we actually execute server-side (read-mostly). */
+/** Actions we actually execute server-side (read-mostly). Everything NOT in
+ * this set (navigate, filterPipeline, apply, setProfile, setPortals,
+ * evaluateCompany, research, setApplyField, remember, …) is web-app-only and
+ * gets the WEB_ONLY_MESSAGE no-op reply. */
 export const ALLOWED_ACTIONS = new Set(['evaluate', 'generatePdf', 'setStatus']);
 
-/**
- * Actions the web registry supports but which are web-app-only for now. Kept as
- * an explicit list for documentation / tests; anything not in ALLOWED_ACTIONS
- * gets the same no-op reply regardless.
- */
-export const WEB_ONLY_ACTIONS = new Set([
-  'navigate',
-  'filterPipeline',
-  'apply',
-  'setProfile',
-  'setPortals',
-  'evaluateCompany',
-  'research',
-  'setApplyField',
-  'remember',
-]);
-
 const WEB_ONLY_MESSAGE = 'That action is only available in the web app.';
+
+/**
+ * Canonical tracker states (mirrors the web registry's CANON_STATUS and
+ * templates/states.yml). setStatus validates against this BEFORE stashing a
+ * pending confirmation so an invalid status is rejected early.
+ */
+export const CANON_STATUS = ['Evaluated', 'Applied', 'Responded', 'Interview', 'Offer', 'Rejected', 'Discarded', 'SKIP'];
+
+/** Resolve a case-insensitive status to its canonical label, or null. */
+export function canonicalizeStatus(status) {
+  if (typeof status !== 'string') return null;
+  const s = status.trim().toLowerCase();
+  return CANON_STATUS.find((c) => c.toLowerCase() === s) || null;
+}
+
+// A confirm-gated pending action lives at most this long before it expires;
+// consulted by hasPending/confirmPending so a stale "yes" can't fire an old
+// write. Slack's own request replay window is 5 min, so this matches.
+export const PENDING_TTL_MS = 5 * 60 * 1000;
 
 // Confirm-gated pending actions, keyed by `${channel}:${thread}`. This is an
 // in-memory map: acceptable for a personal, single-instance tool, but it does
@@ -157,6 +162,21 @@ const WEB_ONLY_MESSAGE = 'That action is only available in the web app.';
 // redeploys between the prompt and the "yes", the user must re-issue the
 // action. Documented in docs/slack-bot.md.
 const defaultPending = new Map();
+
+/**
+ * Return the LIVE (non-expired) pending record for a key, deleting it if it has
+ * expired. Centralizes TTL enforcement so hasPending/confirmPending/dispatch
+ * all agree on what "pending" means.
+ */
+function livePending(pending, key, now = Date.now()) {
+  const p = pending.get(key);
+  if (!p) return null;
+  if (typeof p.at === 'number' && now - p.at > PENDING_TTL_MS) {
+    pending.delete(key);
+    return null;
+  }
+  return p;
+}
 
 // ---------------------------------------------------------------------------
 // Default runners (injectable via ctx for tests / for wiring the real pipeline)
@@ -197,6 +217,8 @@ export function defaultRunSetStatus({ n, status, note } = {}) {
  *   @param {(args:object)=>Promise<{text:string}>} [ctx.runSetStatus] - executes the status write.
  *   @param {Map} [ctx.pending] - the confirm-gate pending map.
  *   @param {string} [ctx.threadKey] - `${channel}:${thread}` key for the confirm gate.
+ *   @param {string} [ctx.userId] - Slack user id of the requester (binds the confirm).
+ *   @param {string} [ctx.teamId] - Slack team/workspace id of the requester (binds the confirm).
  * @returns {Promise<{text:string, confirm?:boolean, executed?:boolean}>}
  */
 export async function dispatchAction(id, args = {}, ctx = {}) {
@@ -229,33 +251,55 @@ export async function dispatchAction(id, args = {}, ctx = {}) {
   }
 
   if (id === 'setStatus') {
-    // CONFIRM-GATED: never write immediately. Stash the pending action keyed by
-    // the Slack thread and ask the user to confirm with "yes".
-    const n = args && args.n;
-    const status = args && args.status;
-    if (n == null || String(n).trim() === '' || !status) {
-      return { text: '⚠️ setStatus needs an application number and a status.' };
+    // CONFIRM-GATED: never write immediately. Validate FIRST, then stash the
+    // pending action keyed by the Slack thread and bound to the requesting user.
+    const n = args && args.n != null ? String(args.n).trim() : '';
+    // Require a numeric application number. set-status.mjs treats a non-numeric
+    // argument as a COMPANY name, so accepting `{"n":"Acme"}` would silently
+    // update by company — reject it here.
+    if (!/^\d+$/.test(n)) {
+      return { text: '⚠️ setStatus needs a numeric application number (e.g. #42).' };
     }
+    // Canonicalize the status against the allowed set BEFORE stashing.
+    const canon = canonicalizeStatus(args && args.status);
+    if (!canon) {
+      return { text: `⚠️ "${args && args.status}" isn't a valid status. Use one of: ${CANON_STATUS.join(', ')}.` };
+    }
+
     const pending = ctx.pending || defaultPending;
     const key = ctx.threadKey || 'default';
-    pending.set(key, { id, args, at: Date.now() });
+    // Don't silently clobber an existing (live) pending action in this thread.
+    const existing = livePending(pending, key);
+    if (existing) {
+      const ex = existing.args || {};
+      return {
+        text: `You already have a pending confirmation in this thread (set #${ex.n} to *${ex.status}*). Reply \`yes\` to confirm it, or \`no\` to cancel, before starting another.`,
+      };
+    }
+    pending.set(key, {
+      id,
+      args: { n, status: canon },
+      at: Date.now(),
+      userId: ctx.userId || null,
+      teamId: ctx.teamId || null,
+    });
     return {
-      text: `You want to set application #${n} to *${status}*. Reply \`yes\` to confirm.`,
+      text: `You want to set application #${n} to *${canon}*. Reply \`yes\` to confirm.`,
       confirm: true,
     };
   }
 
-  return { text: WEB_ONLY_MESSAGE };
+  return { text: WEB_ONLY_MESSAGE }; // unreachable safety net
 }
 
 // ---------------------------------------------------------------------------
 // Confirm-gate helpers
 // ---------------------------------------------------------------------------
 
-/** Does the given Slack thread have a pending confirm-gated action? */
+/** Does the given Slack thread have a LIVE (non-expired) pending action? */
 export function hasPending(threadKey, ctx = {}) {
   const pending = ctx.pending || defaultPending;
-  return pending.has(threadKey || 'default');
+  return livePending(pending, threadKey || 'default') != null;
 }
 
 /**
@@ -270,18 +314,38 @@ export function isAffirmative(text) {
 
 /**
  * Execute the pending confirm-gated action for a thread, then clear it.
- * Returns the runner's result message, or null if there was nothing pending.
+ * Returns the runner's result message, or null if there was nothing LIVE
+ * pending. Enforces two guards:
+ *   - TTL: an expired pending action is dropped and treated as absent.
+ *   - USER BINDING: only the SAME Slack user (and team, when known) who
+ *     requested the action may confirm it — in a shared channel thread another
+ *     user replying "yes" must NOT trigger the first user's write. When the
+ *     confirming user differs, the pending action is LEFT in place (so the
+ *     rightful user can still confirm) and a { mismatch:true } marker is
+ *     returned so the caller can stay silent / explain.
  *
  * @param {string} threadKey
  * @param {object} [ctx] - same injection surface as dispatchAction; uses
- *   ctx.runSetStatus (default: defaultRunSetStatus) for setStatus.
- * @returns {Promise<{text:string, executed?:boolean}|null>}
+ *   ctx.runSetStatus (default: defaultRunSetStatus) for setStatus and
+ *   ctx.userId / ctx.teamId to enforce the user binding.
+ * @returns {Promise<{text:string, executed?:boolean, mismatch?:boolean}|null>}
  */
 export async function confirmPending(threadKey, ctx = {}) {
   const pending = ctx.pending || defaultPending;
   const key = threadKey || 'default';
-  const p = pending.get(key);
+  const p = livePending(pending, key);
   if (!p) return null;
+
+  // USER BINDING: the confirming event must come from the same user/team that
+  // requested the action (when we recorded one). Do NOT consume the pending
+  // action on a mismatch — the rightful user should still be able to confirm.
+  if (p.userId && ctx.userId && p.userId !== ctx.userId) {
+    return { mismatch: true };
+  }
+  if (p.teamId && ctx.teamId && p.teamId !== ctx.teamId) {
+    return { mismatch: true };
+  }
+
   pending.delete(key);
   if (p.id === 'setStatus') {
     const runner = ctx.runSetStatus || defaultRunSetStatus;
