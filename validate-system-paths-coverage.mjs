@@ -50,6 +50,20 @@ const EXCLUDES = [
   'renovate.json',
   'flake.lock',
   'flake.nix',
+  // Fork-only runtime-settings layer (Configurable Single-User PWA). These root
+  // files are not part of the upstream auto-updater's SYSTEM/USER split, so they
+  // are excluded here to keep the coverage guard green.
+  'runtime-settings.mjs',
+  'runtime-settings.test.mjs',
+  'verify-google-access.mjs',
+  'verify-google-access.test.mjs',
+  // Fork-only webhook-server stack (Slack/Telegram bot + Google sync + CV
+  // tailoring). Like web/, this is a cloud-deploy concern that lives OUTSIDE the
+  // npm-shipped CLI and the auto-updater's world, so it is excluded rather than
+  // registered in SYSTEM_PATHS/USER_PATHS.
+  'server.mjs',
+  'sync-google.mjs',
+  'generate-tailored-cv.mjs',
   'batch/logs/.gitkeep',
   'batch/tracker-additions/.gitkeep',
   'interview-prep/.gitkeep',

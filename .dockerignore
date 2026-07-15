@@ -2,6 +2,7 @@
 node_modules
 .env
 .env.*
+config/runtime.json
 .update-dismissed
 .update-lock
 *.log

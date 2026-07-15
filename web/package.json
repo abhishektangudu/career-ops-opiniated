@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test-clean-chips.mjs"
+    "test": "node --test test-clean-chips.mjs runtime-settings-web.test.mjs settings-route.test.mjs verify-google.test.mjs"
   },
   "dependencies": {
     "@paper-design/shaders-react": "^0.0.77",

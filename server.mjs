@@ -20,6 +20,11 @@ import {
 import { scrapeJobDescription } from './scrape-jd.mjs';
 import { generateTailoredCV } from './generate-tailored-cv.mjs';
 
+// Shared runtime-settings loader — resolved PER REQUEST so a value written to
+// config/runtime.json by the PWA takes effect without a redeploy. Precedence is
+// strictly env > file > unset (see runtime-settings.mjs).
+import { resolveAllSettings } from './runtime-settings.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
@@ -36,10 +41,15 @@ app.use('/output', express.static(join(__dirname, 'output')));
 app.use('/reports', express.static(join(__dirname, 'reports')));
 
 const PORT = process.env.PORT || 8080;
-const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
-const DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
-const STORAGE_BUCKET = process.env.GOOGLE_STORAGE_BUCKET;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+// NOTE: GOOGLE_SPREADSHEET_ID / GOOGLE_DRIVE_FOLDER_ID / GOOGLE_STORAGE_BUCKET
+// (and GEMINI_API_KEY / GEMINI_MODEL) are NO LONGER read as module-level
+// constants — that captured env at process start and made a UI-written value
+// invisible to a long-running server. They are resolved per-request via
+// resolveAllSettings({ root: __dirname }) and threaded explicitly into the
+// background/helper paths below (runAsyncPipeline). The boot log below reads a
+// one-time snapshot purely for a startup diagnostic.
 
 // Auth secrets. Each auth path is independent and FAILS CLOSED: if the relevant
 // secret is unset, requests for that path are rejected (never accepted unsigned).
@@ -231,9 +241,18 @@ function postToTelegram(chatId, textMessage) {
 // ---------------------------------------------------------------------------
 // Main Evaluation & Sync Pipeline
 // ---------------------------------------------------------------------------
-async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl }) {
+async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl, settings }) {
   console.log(`[pipeline] Starting evaluation pipeline. Source: ${source}`);
-  
+
+  // Resolve integration settings for THIS run. The caller passes the resolved
+  // values (env > file > unset); fall back to a fresh resolve if omitted so the
+  // helper is safe to call directly. These locals replace the former module
+  // constants — a value the PWA wrote to config/runtime.json is picked up here.
+  const resolved = settings ?? resolveAllSettings({ root: __dirname }).values;
+  const SPREADSHEET_ID = resolved.googleSpreadsheetId;
+  const DRIVE_FOLDER_ID = resolved.googleDriveFolderId;
+  const STORAGE_BUCKET = resolved.googleStorageBucket;
+
   let finalJdText = jdText;
   let pageTitle = '';
   
@@ -530,8 +549,13 @@ app.post('/webhook', (req, res) => {
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
   const baseUrl = `${protocol}://${req.get('host')}`;
 
+  // Resolve integration settings ONCE per request (env > file > unset) and pass
+  // the values explicitly into the background pipeline, which runs after this
+  // handler returns — module scope would have captured stale process-start env.
+  const { values: settings } = resolveAllSettings({ root: __dirname });
+
   // Run the long-running pipeline asynchronously in the background
-  runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl })
+  runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl, settings })
     .catch(err => console.error('[webhook-pipeline] Run error:', err));
 });
 
@@ -541,10 +565,12 @@ app.post('/webhook', (req, res) => {
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   app.listen(PORT, () => {
+    // One-time boot-log snapshot only (values are re-resolved per request).
+    const { values: boot } = resolveAllSettings({ root: __dirname });
     console.log(`🚀 Webhook server listening on port ${PORT}`);
-    console.log(`   Spreadsheet ID: ${SPREADSHEET_ID || 'Not set'}`);
-    console.log(`   GDrive Folder ID: ${DRIVE_FOLDER_ID || 'Not set'}`);
-    console.log(`   GCS Storage Bucket: ${STORAGE_BUCKET || 'Not set'}`);
+    console.log(`   Spreadsheet ID: ${boot.googleSpreadsheetId || 'Not set'}`);
+    console.log(`   GDrive Folder ID: ${boot.googleDriveFolderId || 'Not set'}`);
+    console.log(`   GCS Storage Bucket: ${boot.googleStorageBucket || 'Not set'}`);
   });
 }
 
