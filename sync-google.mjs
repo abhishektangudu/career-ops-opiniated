@@ -121,6 +121,18 @@ export async function syncTrackerToSheets(applicationsFilePath, spreadsheetId, s
     }
   }
 
+  // SAFETY GUARD (destructive-sync protection): syncTrackerToSheets clears the
+  // remote tab (values.clear on A1:Z1000) and rewrites it from the LOCAL tracker.
+  // On an ephemeral filesystem (e.g. a Cloud Run instance that lost data/ after a
+  // restart/redeploy) the local tracker can be empty/stale — and the clear+update
+  // would then WIPE every previously-synced row from the Sheet. If we have no
+  // parseable data rows (header only), skip the destructive sync entirely.
+  // See docs/deploy.md (Persistence) for the durable-volume requirement.
+  if (rows.length <= 1) {
+    console.warn('[sheets] local tracker empty — skipping destructive sync to avoid wiping remote rows');
+    return;
+  }
+
   // Ensure target sheet exists, or create it
   try {
     await sheets.spreadsheets.batchUpdate({

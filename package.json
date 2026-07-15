@@ -51,7 +51,9 @@
     "build:dashboard": "node build-dashboard.mjs",
     "serve:dashboard": "cd dashboard && go run . --path ..",
     "postinstall": "npx playwright install chromium --with-deps || npx playwright install chromium --with-deps",
-    "manifesto": "node manifesto.mjs"
+    "manifesto": "node manifesto.mjs",
+    "server": "node server.mjs",
+    "start": "node server.mjs"
   },
   "keywords": [
     "ai",
@@ -73,6 +75,8 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "dotenv": "^17.0.0",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0",
     "js-yaml": "^4.1.1",
     "playwright": "1.61.1"
   }

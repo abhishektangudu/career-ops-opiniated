@@ -1,16 +1,54 @@
 .git
 node_modules
-output
-batch/logs
-batch/batch-state.tsv
-batch/batch-input.tsv
-batch/tracker-additions
-jds/*
-!jds/.gitkeep
-reports/*.md
 .env
+.env.*
 .update-dismissed
 .update-lock
 *.log
 .DS_Store
+
+# ── User-layer / private inputs — NEVER bake these into the image ─────────────
+# These are the repo's USER_PATHS (see update-system.mjs) plus git-ignored
+# personal data. They contain PII (your CV, profile, tracker, interview notes).
+# The deployed server must receive them at RUNTIME from a mounted durable volume
+# and/or Secret Manager, not from the image. See docs/deploy.md (Persistence).
+#
+# NOTE: we exclude specific user files, NOT whole shared dirs — config/ and
+# modes/ also hold SYSTEM assets that the pipeline needs at runtime, which are
+# kept (see the "intentionally kept" note at the bottom).
+cv.md
+config/profile.yml
+config/cv-facts.json
+config/benchmarks.yml
+config/plugins.yml
+modes/_profile.md
+modes/_custom.md
+voice-dna.md
+portals.yml
+article-digest.md
+data/
+interview-prep/
 writing-samples
+jds/*
+!jds/.gitkeep
+reports/*.md
+output
+plugins.local/
+plugins.lock
+.claude/settings.json
+.claude/settings.local.json
+.claude/memory/
+
+# ── Build/runtime scratch that doesn't belong in the image ───────────────────
+batch/logs
+batch/batch-state.tsv
+batch/batch-input.tsv
+batch/tracker-additions
+
+# ── Credentials — never ship a key file; Cloud Run uses ADC (runtime SA) ─────
+sa-key.json
+
+# NOTE: templates/, fonts/, providers/, and the SYSTEM modes/ files (everything
+# under modes/ except _profile.md / _custom.md above) are intentionally NOT
+# excluded — they are required at runtime by the Slack pipeline. config/ keeps
+# its *.example.* system files too (only the user config files above are cut).

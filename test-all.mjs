@@ -173,6 +173,10 @@ const scripts = [
   { name: 'followup-cadence.test.mjs', expectExit: 0 },
   { name: 'process-quality.test.mjs', expectExit: 0 },
   { name: 'reply-matcher.test.mjs', expectExit: 0 },
+  // Fork-only: Slack/Telegram remote-access server suites (HMAC verify, auth
+  // routing, eval-args regression, scrape-jd parse/error paths).
+  { name: 'server.test.mjs', expectExit: 0 },
+  { name: 'scrape-jd.test.mjs', expectExit: 0 },
   { name: 'validate-portals.mjs --file templates/portals.example.yml', expectExit: 0 },
   { name: 'validate-system-paths-coverage.mjs --self-test', expectExit: 0 },
   { name: 'validate-system-paths-coverage.mjs', expectExit: 0 },
