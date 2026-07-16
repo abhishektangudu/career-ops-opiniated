@@ -21,9 +21,11 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# Install deps first (cached layer).
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# Install deps first (cached layer). Use the lockfile + `npm ci` for a
+# deterministic, reproducible install (keeps playwright pinned to the version
+# that matches the base image's bundled Chromium).
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 # Bake the sources in (respects .dockerignore).
 COPY . .
