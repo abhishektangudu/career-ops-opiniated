@@ -315,8 +315,12 @@ const model = genAI.getGenerativeModel({
     { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
   ],
   generationConfig: {
-    temperature: 0.4,      // deterministic enough for structured evaluation
-    maxOutputTokens: 8192, // full 7-block evaluation
+    temperature: 0.4,       // deterministic enough for structured evaluation
+    // gemini-2.5-flash is a thinking model: reasoning ("thoughts") tokens count
+    // against maxOutputTokens, so an 8192 ceiling could truncate the full 7-block
+    // report (finishReason: MAX_TOKENS). 32768 leaves generous headroom for
+    // thinking + the complete report while staying well under the 65536 model max.
+    maxOutputTokens: 32768,
   },
 });
 
@@ -339,7 +343,7 @@ Evaluate this job description according to the system instructions and generate 
     ],
     generationConfig: {
       temperature: 0.4,
-      maxOutputTokens: 8192,
+      maxOutputTokens: 32768,
     },
     safetySettings: [
       { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
