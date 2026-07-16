@@ -571,6 +571,27 @@ if (isMain) {
     console.log(`   Spreadsheet ID: ${boot.googleSpreadsheetId || 'Not set'}`);
     console.log(`   GDrive Folder ID: ${boot.googleDriveFolderId || 'Not set'}`);
     console.log(`   GCS Storage Bucket: ${boot.googleStorageBucket || 'Not set'}`);
+
+    // Debug file existence for Cloud Run mounts
+    import('fs').then((fs) => {
+      import('path').then((path) => {
+        const debugFiles = ['cv.md', 'config/profile.yml', 'modes/_profile.md', 'modes/_custom.md', 'portals.yml', 'modes/_shared.md', 'modes/oferta.md'];
+        debugFiles.forEach(f => {
+          const p = path.join(__dirname, f);
+          try {
+            const stats = fs.statSync(p);
+            const isSym = fs.lstatSync(p).isSymbolicLink();
+            console.log(`🔍 [filecheck] ${f} -> EXISTS (size: ${stats.size}, symlink: ${isSym})`);
+            if (stats.size > 0) {
+              const content = fs.readFileSync(p, 'utf-8').trim().slice(0, 20);
+              console.log(`   Content preview: "${content.replace(/\r?\n/g, ' ')}"`);
+            }
+          } catch (err) {
+            console.log(`🔍 [filecheck] ${f} -> ERROR: ${err.message}`);
+          }
+        });
+      });
+    });
   });
 }
 

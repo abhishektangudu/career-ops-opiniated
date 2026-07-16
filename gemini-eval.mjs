@@ -282,7 +282,13 @@ IMPORTANT OPERATING RULES FOR THIS CLI SESSION
    - For Block G (Legitimacy): analyze the JD text only; skip URL/page freshness checks.
    - Post-evaluation file saving is handled by the script, not by you.
 2. Generate Blocks A through G in full, in English, unless the JD is in another language.
-3. At the very end, output a machine-readable summary block in this exact format:
+3. NO TABLES RULE: Do NOT generate Markdown tables. To prevent tokenizer repetition loops and ensure clean rendering, format all tables requested in the evaluation methodology (such as Block B, Block D, and Block G) as structured bulleted lists or nested key-value lists instead. For example:
+   - Requirement: ...
+     - Match: ...
+     - Gap/Mitigation: ...
+4. CONCISENESS RULE: Be extremely concise in your matches and explanations. Under Block B, do NOT copy entire paragraphs or career history blocks from the CV; quote only the single most relevant sentence or phrase (maximum 1-2 lines per match). Keep all other block explanations crisp and compact so that the entire evaluation fits comfortably within your output token limit.
+5. DO NOT generate the Cover Letter Draft. Omit the cover letter draft section entirely to conserve tokens. Focus only on delivering Blocks A through G and the SCORE_SUMMARY block.
+6. At the very end, output a machine-readable summary block in this exact format:
 
 ---SCORE_SUMMARY---
 COMPANY: <company name or "Unknown">
@@ -301,6 +307,13 @@ console.log(`🤖  Calling Gemini (${modelName})... this may take 30-60 seconds.
 const genAI = new GoogleGenerativeAI(apiKey);
 const model = genAI.getGenerativeModel({
   model: modelName,
+  systemInstruction: systemPrompt,
+  safetySettings: [
+    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+  ],
   generationConfig: {
     temperature: 0.4,      // deterministic enough for structured evaluation
     maxOutputTokens: 8192, // full 7-block evaluation
@@ -309,10 +322,32 @@ const model = genAI.getGenerativeModel({
 
 let evaluationText;
 try {
-  const result = await model.generateContent([
-    { text: systemPrompt },
-    { text: `\n\nJOB DESCRIPTION TO EVALUATE:\n\n${jdText}` },
-  ]);
+  const result = await model.generateContent({
+    contents: [
+      {
+        role: 'user',
+        parts: [{
+          text: `Please evaluate the following job description:
+
+<JOB_DESCRIPTION>
+${jdText}
+</JOB_DESCRIPTION>
+
+Evaluate this job description according to the system instructions and generate the evaluation report (Blocks A through G) and the SCORE_SUMMARY block now.`
+        }]
+      }
+    ],
+    generationConfig: {
+      temperature: 0.4,
+      maxOutputTokens: 8192,
+    },
+    safetySettings: [
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+    ]
+  });
   evaluationText = result.response.text();
 } catch (err) {
   const sanitizedMsg = (err.message || '').split(apiKey).join('[REDACTED]');
@@ -328,6 +363,9 @@ try {
 try {
   validateEvaluationShape(evaluationText);
 } catch (err) {
+  console.log('--- DEBUG: RAW GEMINI RESPONSE ---');
+  console.log(evaluationText);
+  console.log('---------------------------------');
   console.error('❌  Gemini output failed validation:', err.message);
   console.error('    No report was saved. Retry, lower temperature, or use the Claude pipeline for this JD.');
   process.exit(1);
