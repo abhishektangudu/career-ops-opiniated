@@ -3,7 +3,7 @@ import express from 'express';
 import { execFile } from 'child_process';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { readdirSync, readFileSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, statSync, lstatSync } from 'fs';
 import https from 'https';
 import http from 'http';
 import crypto from 'crypto';
@@ -578,20 +578,16 @@ if (isMain) {
     // are the user's PII files (cv.md, profile.yml, etc.) that must not land in
     // Cloud Run logs.
     if (process.env.CAREER_OPS_DEBUG === '1') {
-      import('fs').then((fs) => {
-        import('path').then((path) => {
-          const debugFiles = ['cv.md', 'config/profile.yml', 'modes/_profile.md', 'modes/_custom.md', 'portals.yml', 'modes/_shared.md', 'modes/oferta.md'];
-          debugFiles.forEach(f => {
-            const p = path.join(__dirname, f);
-            try {
-              const stats = fs.statSync(p);
-              const isSym = fs.lstatSync(p).isSymbolicLink();
-              console.log(`🔍 [filecheck] ${f} -> EXISTS (size: ${stats.size}, symlink: ${isSym})`);
-            } catch (err) {
-              console.log(`🔍 [filecheck] ${f} -> ERROR: ${err.message}`);
-            }
-          });
-        });
+      const debugFiles = ['cv.md', 'config/profile.yml', 'modes/_profile.md', 'modes/_custom.md', 'portals.yml', 'modes/_shared.md', 'modes/oferta.md'];
+      debugFiles.forEach(f => {
+        const p = join(__dirname, f);
+        try {
+          const stats = statSync(p);
+          const isSym = lstatSync(p).isSymbolicLink();
+          console.log(`🔍 [filecheck] ${f} -> EXISTS (size: ${stats.size}, symlink: ${isSym})`);
+        } catch (err) {
+          console.log(`🔍 [filecheck] ${f} -> ERROR: ${err.message}`);
+        }
       });
     }
   });
