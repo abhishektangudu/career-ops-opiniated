@@ -50,6 +50,10 @@ const EXCLUDES = [
   'renovate.json',
   'flake.lock',
   'flake.nix',
+  // Fork-only: the root npm lockfile is committed (upstream gitignores it) so the
+  // Docker image's `npm ci` has a deterministic, reproducible install. It is not
+  // part of the auto-updater's SYSTEM/USER split, so it is excluded here.
+  'package-lock.json',
   // Fork-only runtime-settings layer (Configurable Single-User PWA). These root
   // files are not part of the upstream auto-updater's SYSTEM/USER split, so they
   // are excluded here to keep the coverage guard green.

@@ -3,7 +3,7 @@ import express from 'express';
 import { execFile } from 'child_process';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { readdirSync, readFileSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, statSync, lstatSync } from 'fs';
 import https from 'https';
 import http from 'http';
 import crypto from 'crypto';
@@ -572,26 +572,24 @@ if (isMain) {
     console.log(`   GDrive Folder ID: ${boot.googleDriveFolderId || 'Not set'}`);
     console.log(`   GCS Storage Bucket: ${boot.googleStorageBucket || 'Not set'}`);
 
-    // Debug file existence for Cloud Run mounts
-    import('fs').then((fs) => {
-      import('path').then((path) => {
-        const debugFiles = ['cv.md', 'config/profile.yml', 'modes/_profile.md', 'modes/_custom.md', 'portals.yml', 'modes/_shared.md', 'modes/oferta.md'];
-        debugFiles.forEach(f => {
-          const p = path.join(__dirname, f);
-          try {
-            const stats = fs.statSync(p);
-            const isSym = fs.lstatSync(p).isSymbolicLink();
-            console.log(`🔍 [filecheck] ${f} -> EXISTS (size: ${stats.size}, symlink: ${isSym})`);
-            if (stats.size > 0) {
-              const content = fs.readFileSync(p, 'utf-8').trim().slice(0, 20);
-              console.log(`   Content preview: "${content.replace(/\r?\n/g, ' ')}"`);
-            }
-          } catch (err) {
-            console.log(`🔍 [filecheck] ${f} -> ERROR: ${err.message}`);
-          }
-        });
+    // Debug file existence for Cloud Run Secret Manager mounts.
+    // Gated behind CAREER_OPS_DEBUG so it never runs on a normal prod boot, and
+    // logs only existence/size/symlink status — never file CONTENT, since these
+    // are the user's PII files (cv.md, profile.yml, etc.) that must not land in
+    // Cloud Run logs.
+    if (process.env.CAREER_OPS_DEBUG === '1') {
+      const debugFiles = ['cv.md', 'config/profile.yml', 'modes/_profile.md', 'modes/_custom.md', 'portals.yml', 'modes/_shared.md', 'modes/oferta.md'];
+      debugFiles.forEach(f => {
+        const p = join(__dirname, f);
+        try {
+          const stats = statSync(p);
+          const isSym = lstatSync(p).isSymbolicLink();
+          console.log(`🔍 [filecheck] ${f} -> EXISTS (size: ${stats.size}, symlink: ${isSym})`);
+        } catch (err) {
+          console.log(`🔍 [filecheck] ${f} -> ERROR: ${err.message}`);
+        }
       });
-    });
+    }
   });
 }
 
