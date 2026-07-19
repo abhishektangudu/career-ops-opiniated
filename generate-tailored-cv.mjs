@@ -4,6 +4,11 @@ import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import yaml from 'js-yaml';
+// Shared runtime-settings loader (env > config/runtime.json > unset) so a key or
+// model saved from the PWA Integrations tab reaches the CV generator too — the
+// evaluator (gemini-eval.mjs) already reads through this loader; this keeps the
+// two Gemini call sites consistent instead of the CV path reading raw env only.
+import { resolveSetting, DEFAULT_GEMINI_MODEL } from './runtime-settings.mjs';
 
 // Load environment variables
 try {
@@ -25,11 +30,11 @@ const PATHS = {
   generatePdfScript: join(__dirname, 'generate-pdf.mjs')
 };
 
-async function classifyTargetOpportunity(apiKey, companyName, roleTitle, jdText) {
+async function classifyTargetOpportunity(apiKey, companyName, roleTitle, jdText, modelName = DEFAULT_GEMINI_MODEL) {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
+      model: modelName,
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.1
@@ -81,13 +86,17 @@ Guidance:
 }
 
 async function generateTailoredCV(jdText, companyName, roleTitle) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  // Resolve via the shared loader (env > config/runtime.json > unset) so a key
+  // saved from the PWA Integrations tab is honored here, matching gemini-eval.mjs.
+  const apiKey = resolveSetting('geminiApiKey', { root: __dirname });
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not set in environment variables or .env file.');
+    throw new Error('GEMINI_API_KEY is not set (env, config/runtime.json, or .env file).');
   }
+  // Same precedence for the model; falls back to the shared default when unset.
+  const preferredModel = resolveSetting('geminiModel', { root: __dirname }) || DEFAULT_GEMINI_MODEL;
 
   console.log(`🤖 Classifying target opportunity (${companyName})...`);
-  const classification = await classifyTargetOpportunity(apiKey, companyName, roleTitle, jdText);
+  const classification = await classifyTargetOpportunity(apiKey, companyName, roleTitle, jdText, preferredModel);
   console.log(`📊 Classified target: Scale=${classification.scale}, Ecosystem=${classification.ecosystem}, Titling=${classification.titling}`);
 
   let dynamicDirectives = '';
@@ -350,7 +359,7 @@ Ensure your JSON is valid and doesn't contain any syntax errors or markdown back
 
   let responseText;
   let lastError = null;
-  const preferredModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  // preferredModel resolved above via the shared loader (env > runtime.json > default).
   const modelsToTry = [...new Set([
     preferredModel,
     'gemini-2.5-flash',
