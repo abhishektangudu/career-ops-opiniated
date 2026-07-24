@@ -20,6 +20,143 @@ try {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Matches a job wrapper opening tag tolerantly: any `<div …>` whose class
+// attribute carries "job" as a standalone token. Accepts attribute/quote/
+// whitespace variation — quoted (`<div  class="job">`, `<div class="job"
+// data-id="1">`, `<div class='job'>`, `class="foo job"`) and unquoted
+// (`<div class=job>`) — but NOT the inner `job-header` / `job-role` wrappers,
+// whose class token is different (the unquoted branch's `(?=[\s>])` lookahead
+// stops `class=job-header` from matching).
+const JOB_WRAPPER_RE = /<div\b[^>]*\bclass\s*=\s*(?:(["'])(?:[^"']*\s)?job(?:\s[^"']*)?\1|job(?=[\s>]))[^>]*>/gi;
+
+// Case-insensitive, boundary-aware bullet matcher used consistently for the
+// initial guard, per-role counting, and post-trim validation. `\b` excludes
+// `<link>` etc. while matching `<li>`, `<li >`, and uppercase `<LI>`.
+const LI_OPEN_RE = /<li\b/gi;
+
+/**
+ * Return the start index of every job wrapper opening tag in `html`. A fresh
+ * regex is used per call so the shared global `lastIndex` state can't leak.
+ */
+function findJobStarts(html) {
+  const re = new RegExp(JOB_WRAPPER_RE.source, JOB_WRAPPER_RE.flags);
+  const starts = [];
+  let m;
+  while ((m = re.exec(html)) !== null) starts.push(m.index);
+  return starts;
+}
+
+/**
+ * Split `html` into one segment per job wrapper, each running from its wrapper's
+ * start index to the next wrapper's start (or end of string). Closing tags are
+ * irrelevant, so a missing `</div>` can't merge two roles.
+ */
+function jobSegments(html, starts) {
+  return starts.map((start, i) => html.slice(start, starts[i + 1] ?? html.length));
+}
+
+/**
+ * Count `<li>` bullets in `html`, case-insensitively and boundary-aware (so
+ * `<link>` is never mistaken for `<li>`). A fresh regex avoids global-state leaks.
+ */
+function countBullets(html) {
+  return (html.match(new RegExp(LI_OPEN_RE.source, LI_OPEN_RE.flags)) || []).length;
+}
+
+/**
+ * Cap the total `<li>` bullets inside a single job segment, keeping the first
+ * `cap` items (the LLM orders the most JD-relevant bullets first) and dropping
+ * the rest in place. Trimming by total count — rather than per `<ul>` — means a
+ * role that (abnormally) splits its bullets across multiple `<ul>` lists is
+ * still held to the same budget.
+ */
+function capSegmentBullets(segment, cap) {
+  if (countBullets(segment) <= cap) return segment;
+  let seen = 0;
+  return segment.replace(/<li\b[\s\S]*?<\/li>/gi, (li) => {
+    seen += 1;
+    return seen <= cap ? li : '';
+  });
+}
+
+/**
+ * Deterministically enforce the per-role bullet budget on the LLM-produced
+ * EXPERIENCE HTML. The prompt asks Gemini to cap bullets, but an LLM instruction
+ * is not a guarantee — it routinely returns more. This trims the actual `<li>`
+ * items per job block in code so the cap always holds.
+ *
+ * Rule (matches the prompt directives):
+ *   - one-page style: every role capped at `recentMax` (default 3).
+ *   - enterprise style: the `recentRoleCount` most-recent roles capped at
+ *     `recentMax` (default 6), every older role at `olderMax` (default 4).
+ *   - never drops a role below `minBullets` (only trims from the end, keeping the
+ *     highest-priority bullets the LLM already ordered first).
+ *
+ * Job blocks are located by their wrapper opening tag (see `JOB_WRAPPER_RE`) and
+ * scoped by wrapper-start boundaries — NOT by a `</ul></div>` closing pattern.
+ * That makes trimming robust to LLM markup variation: extra attributes/quotes/
+ * whitespace on the wrapper, multiple `<ul>` lists in one role, or a missing
+ * outer `</div>` no longer bypass the cap. A role with no `<ul>` still consumes
+ * a recency slot, so the recent/older boundary can't silently shift.
+ *
+ * After trimming, per-role counts are re-validated; if any role is still over
+ * budget the markup was structurally unexpected and we throw rather than ship an
+ * over-cap CV (the exact bug this function exists to prevent). Likewise, if the
+ * HTML has bullets but no recognizable job wrapper, we fail closed instead of
+ * returning the uncapped HTML unchanged.
+ *
+ * @param {string} experienceHtml - Raw EXPERIENCE HTML from the model.
+ * @param {{recentMax?: number, olderMax?: number, minBullets?: number, recentRoleCount?: number}} [opts]
+ * @returns {string} EXPERIENCE HTML with each role's bullets capped.
+ */
+export function capExperienceBullets(experienceHtml, opts = {}) {
+  const recentMax = opts.recentMax ?? 6;
+  const olderMax = opts.olderMax ?? 4;
+  const minBullets = opts.minBullets ?? 2;
+  const recentRoleCount = opts.recentRoleCount ?? 2;
+
+  if (typeof experienceHtml !== 'string' || countBullets(experienceHtml) === 0) {
+    return experienceHtml;
+  }
+
+  const capForRole = (jobIndex) =>
+    Math.max(jobIndex < recentRoleCount ? recentMax : olderMax, minBullets);
+
+  // Locate every job wrapper. Each job segment runs from its wrapper's start to
+  // the next wrapper's start (or end of string) — independent of closing tags.
+  const starts = findJobStarts(experienceHtml);
+  if (starts.length === 0) {
+    // There are bullets but no recognizable job wrapper. Rather than silently
+    // ship an uncapped CV (the exact bug this function prevents), fail closed.
+    throw new Error(
+      'Bullet budget enforcement failed: EXPERIENCE HTML has bullets but no recognizable ' +
+      'job wrapper (`<div class="job">`). The markup shape was not recognized.'
+    );
+  }
+
+  const prefix = experienceHtml.slice(0, starts[0]);
+  const result =
+    prefix +
+    jobSegments(experienceHtml, starts)
+      .map((segment, i) => capSegmentBullets(segment, capForRole(i)))
+      .join('');
+
+  // Safety net: no role may exceed its budget after trimming.
+  const finalStarts = findJobStarts(result);
+  jobSegments(result, finalStarts).forEach((segment, i) => {
+    const count = countBullets(segment);
+    const cap = capForRole(i);
+    if (count > cap) {
+      throw new Error(
+        `Bullet budget enforcement failed: role #${i + 1} still has ${count} bullets after trimming ` +
+        `(cap ${cap}). The EXPERIENCE HTML shape was not recognized.`
+      );
+    }
+  });
+
+  return result;
+}
+
 // Paths
 const PATHS = {
   template: join(__dirname, 'templates', 'cv-template.html'),
@@ -402,6 +539,21 @@ Ensure your JSON is valid and doesn't contain any syntax errors or markdown back
   } catch (parseErr) {
     console.error('Failed to parse Gemini JSON response. Raw output:\n', responseText);
     throw new Error('Gemini output was not valid JSON.');
+  }
+
+  // Deterministically enforce the per-role bullet budget. The prompt asks the
+  // model to cap bullets, but that instruction isn't reliably obeyed, so trim
+  // the actual <li> items in code. One-page style: every role max 3; enterprise
+  // style: two most-recent roles max 6, older roles max 4 (matches the prompt).
+  if (typeof tailoredData.EXPERIENCE === 'string') {
+    const bulletsBefore = countBullets(tailoredData.EXPERIENCE);
+    tailoredData.EXPERIENCE = useOnePageStyle
+      ? capExperienceBullets(tailoredData.EXPERIENCE, { recentMax: 3, olderMax: 3 })
+      : capExperienceBullets(tailoredData.EXPERIENCE, { recentMax: 6, olderMax: 4, recentRoleCount: 2 });
+    const bulletsAfter = countBullets(tailoredData.EXPERIENCE);
+    if (bulletsAfter < bulletsBefore) {
+      console.log(`✂️  Bullet budget enforced: trimmed ${bulletsBefore - bulletsAfter} over-cap bullet(s) (${bulletsBefore} → ${bulletsAfter}).`);
+    }
   }
 
   // Handle static replacements

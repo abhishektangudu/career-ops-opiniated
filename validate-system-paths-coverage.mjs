@@ -83,6 +83,7 @@ const EXCLUDES = [
   'server.test.mjs',
   'scrape-jd.test.mjs',
   'gemini-eval.test.mjs',
+  'generate-tailored-cv.test.mjs',
   'Dockerfile.server',
 ];
 
