@@ -119,6 +119,7 @@ async function generateTailoredCV(jdText, companyName, roleTitle) {
   * **Retain Salesforce Branding:** Keep candidate titles formal and Salesforce-centric (e.g., "Lead Salesforce Developer", "Sr. Salesforce Developer").
   * **Emphasize Platform Governance & Compliance:** Highlight "Force.com Security Reviews," "Salesforce Governor Limit mitigation," "sharing and security models," and "release governance (Copado, SFDX)."
   * **Highlight Certifications:** Make sure the certifications listed at the end are emphasized as a key differentiator.
+  * **Bullet Budgeting (tapered):** Do NOT list every bullet from the original CV. Cap bullets per role so the layout stays balanced and scannable: the TWO most recent roles get a MAXIMUM of 6 bullets each; every older role gets a MAXIMUM of 4 bullets each. Always keep at least 2 bullets per role. Select the most impactful, metric-driven, and JD-aligned achievements and drop the weakest/most redundant ones to stay within these limits.
 `;
   }
 
