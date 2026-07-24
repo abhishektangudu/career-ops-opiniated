@@ -134,16 +134,20 @@ export function parseReportFilenameFromStdout(stdout) {
 
 /**
  * Build the argv array for invoking gemini-eval.mjs.
- * IMPORTANT: gemini-eval.mjs has NO `--url` flag; any non-flag arg is treated as
- * JD text. So we pass ONLY the scraped JD text — never the URL (which would leak
- * into the evaluated text and pollute the eval).
+ * IMPORTANT: the scraped/pasted JD text is passed as the ONLY positional arg;
+ * gemini-eval.mjs treats any non-flag arg as JD text. The source posting URL,
+ * when known, is passed via the explicit `--url` flag so it is recorded in the
+ * report header WITHOUT leaking into the evaluated text and polluting the eval.
  *
  * @param {string} evalScript - Absolute path to gemini-eval.mjs.
  * @param {string} jdText - The scraped job description text.
+ * @param {string} [jdUrl] - Optional source posting URL for the report header.
  * @returns {string[]} argv for execFile (excluding the node executable).
  */
-export function buildEvalArgs(evalScript, jdText) {
-  return [evalScript, jdText];
+export function buildEvalArgs(evalScript, jdText, jdUrl = '') {
+  const args = [evalScript, jdText];
+  if (jdUrl) args.push('--url', jdUrl);
+  return args;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,10 +276,11 @@ async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl
     const updateMsg = `⏳ Job description loaded. Running Gemini evaluation...`;
     sendResponse(source, responseTarget, updateMsg);
 
-    // 2. Run gemini-eval.mjs. gemini-eval.mjs has NO `--url` flag — any non-flag
-    // arg is treated as JD text — so pass ONLY the scraped JD text (finalJdText).
+    // 2. Run gemini-eval.mjs. The scraped JD text is the only positional arg;
+    // the source URL (if any) is passed via --url so it lands in the report
+    // header without being evaluated as JD text.
     const evalScript = join(__dirname, 'gemini-eval.mjs');
-    const evalArgs = buildEvalArgs(evalScript, finalJdText);
+    const evalArgs = buildEvalArgs(evalScript, finalJdText, jdUrl);
 
     execFile(process.execPath, evalArgs, { cwd: __dirname }, async (error, stdout, stderr) => {
       if (error) {

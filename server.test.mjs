@@ -157,12 +157,24 @@ test('isSlackShapedBody: non-slack shapes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// (c) eval-args regression — must NOT contain `--url`
+// (c) eval-args — the URL must NEVER be a positional (JD-text) arg, but IS
+//     passed via the explicit --url flag when known (recorded in the header,
+//     not evaluated).
 // ---------------------------------------------------------------------------
-test('buildEvalArgs: invokes evaluator WITHOUT --url', () => {
+test('buildEvalArgs: no URL -> JD text only, no --url flag', () => {
   const args = buildEvalArgs('/abs/gemini-eval.mjs', 'the scraped jd text');
   assert.deepEqual(args, ['/abs/gemini-eval.mjs', 'the scraped jd text']);
-  assert.ok(!args.includes('--url'), 'eval args must not contain --url');
+  assert.ok(!args.includes('--url'), 'eval args must not contain --url when no URL given');
+});
+
+test('buildEvalArgs: URL passed via --url flag, never as a positional JD arg', () => {
+  const url = 'https://boards.example.com/jobs/123';
+  const args = buildEvalArgs('/abs/gemini-eval.mjs', 'the scraped jd text', url);
+  assert.deepEqual(args, ['/abs/gemini-eval.mjs', 'the scraped jd text', '--url', url]);
+  // The URL must appear ONLY as the value after the --url flag, never merged
+  // into the positional JD text (which would pollute the evaluation).
+  assert.equal(args[1], 'the scraped jd text');
+  assert.equal(args[args.indexOf('--url') + 1], url);
 });
 
 // ---------------------------------------------------------------------------
