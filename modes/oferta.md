@@ -374,11 +374,11 @@ Save full evaluation in `reports/{###}-{company-slug}-{YYYY-MM-DD}.md`.
 # Evaluation: {Company} — {Role}
 
 **Date:** {YYYY-MM-DD}
-**URL:**
 **Via:** {agency/recruiter firm, or — for direct applications}
 **Archetype:** {detected}
 **Score:** {X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
+**URL:**
 **PDF:** {path or pending}
 
 ---
