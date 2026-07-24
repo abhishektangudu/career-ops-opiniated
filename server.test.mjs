@@ -24,7 +24,7 @@ process.env.SERVER_API_KEY = API_KEY;
 // the auth guard rejects before that, and 200-path requests below are shaped so
 // the pipeline runs in the background and is harmless / ignored).
 
-const { app, verifySlackSignature, isSlackShapedBody, buildEvalArgs, parseReportFilenameFromStdout } = await import('./server.mjs');
+const { app, verifySlackSignature, isSlackShapedBody, buildEvalArgs, parseReportFilenameFromStdout, looksLikeBotWall } = await import('./server.mjs');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -175,6 +175,55 @@ test('buildEvalArgs: URL passed via --url flag, never as a positional JD arg', (
   // into the positional JD text (which would pollute the evaluation).
   assert.equal(args[1], 'the scraped jd text');
   assert.equal(args[args.indexOf('--url') + 1], url);
+});
+
+// ---------------------------------------------------------------------------
+// (d) bot-wall detection — a scraped anti-bot / "security verification" page
+//     must be recognised so the pipeline fails fast instead of evaluating it.
+// ---------------------------------------------------------------------------
+test('looksLikeBotWall: flags a short security-verification interstitial', () => {
+  const wall = 'jobs.gusto.com\nPerforming security verification\nThis website uses a security service to protect against malicious bots.';
+  assert.equal(looksLikeBotWall(wall), true);
+});
+
+test('looksLikeBotWall: flags common Cloudflare/WAF challenge phrasings', () => {
+  assert.equal(looksLikeBotWall('Checking if the site connection is secure'), true);
+  assert.equal(looksLikeBotWall('Please verify you are human before continuing.'), true);
+  assert.equal(looksLikeBotWall('Attention Required! | Cloudflare. Ray ID: 8ab12cd'), true);
+});
+
+test('looksLikeBotWall: flags a short Cloudflare "Just a moment" interstitial', () => {
+  // Regression: this variant must not slip past the 100-char pipeline floor.
+  const wall = 'Just a moment...\nchecking your browser before accessing the site. This process is automatic.';
+  assert.equal(looksLikeBotWall(wall), true);
+});
+
+test('looksLikeBotWall: does not flag a short legitimate JD mentioning "access denied"', () => {
+  // Regression: "access denied" is common in security/support JDs and must not
+  // be a standalone wall marker.
+  const jd = 'Security Engineer. You will triage access denied errors, audit IAM policies, and harden our WAF. Requirements: 3+ years in application security.';
+  assert.ok(jd.length < 1500);
+  assert.equal(looksLikeBotWall(jd), false);
+});
+
+test('looksLikeBotWall: does not flag a real job description', () => {
+  const jd = 'Senior Backend Engineer. '.repeat(80) + 'Responsibilities include building APIs. Requirements: 5+ years experience.';
+  assert.equal(looksLikeBotWall(jd), false);
+});
+
+test('looksLikeBotWall: does not flag a long JD that merely mentions a marker phrase', () => {
+  // A genuine, substantial posting that happens to say "access denied" in prose
+  // must NOT be treated as a wall (length guard keeps false positives away).
+  const jd = 'We build authorization systems. '.repeat(100) + ' Our product returns access denied errors on unauthorized calls.';
+  assert.ok(jd.length > 1500);
+  assert.equal(looksLikeBotWall(jd), false);
+});
+
+test('looksLikeBotWall: empty / whitespace text is not a wall', () => {
+  assert.equal(looksLikeBotWall(''), false);
+  assert.equal(looksLikeBotWall('   \n  '), false);
+  assert.equal(looksLikeBotWall(null), false);
+  assert.equal(looksLikeBotWall(undefined), false);
 });
 
 // ---------------------------------------------------------------------------

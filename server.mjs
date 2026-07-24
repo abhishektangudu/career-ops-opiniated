@@ -150,6 +150,67 @@ export function buildEvalArgs(evalScript, jdText, jdUrl = '') {
   return args;
 }
 
+// Anti-bot / WAF interstitial pages (Cloudflare, PerimeterX, DataDome, hCaptcha,
+// Incapsula, "security verification" walls, etc.) render a challenge page instead
+// of the posting. When a scrape returns one, the "JD" is really a challenge page —
+// evaluating it wastes an expensive Gemini call and produces a confusing
+// "missing Block A…G" validation error. All markers are lowercased and matched
+// as substrings against lowercased page text.
+//
+// STRONG markers are vendor/challenge signatures that a real posting would never
+// contain, so they flag at ANY length. Kept aligned with the challenge patterns
+// in liveness-core.mjs (that file is upstream-owned, so we intentionally keep a
+// local copy rather than import its private list).
+const STRONG_BOT_WALL_MARKERS = [
+  'just a moment',
+  'performing security verification',
+  'security service to protect against',
+  'checking your browser before',
+  'checking if the site connection is secure',
+  'enable javascript and cookies to continue',
+  'please complete the security check',
+  'attention required',
+  'ddos protection by',
+  'ray id:',
+  'cf-ray',
+  'cf-browser-verification',
+  'px-captcha',
+  'request unsuccessful. incapsula',
+];
+
+// AMBIGUOUS markers are natural-language phrases a legitimate short page might
+// also contain, so they only flag when the page is short (see MAX_BOT_WALL_LENGTH).
+const AMBIGUOUS_BOT_WALL_MARKERS = [
+  'verify you are not a bot',
+  'verify you are human',
+  'verify you are a human',
+  'are you a robot',
+  'please enable cookies',
+  'unusual traffic from your',
+];
+
+// A genuine JD is substantial; anti-bot interstitials are short. Ambiguous
+// natural-language markers only count on pages at or below this length, so a
+// long, real posting that merely mentions such a phrase is never dropped.
+const MAX_BOT_WALL_LENGTH = 1500;
+
+/**
+ * Heuristic: does scraped text look like an anti-bot / WAF challenge page
+ * rather than a real job description? A strong vendor/challenge signature flags
+ * at any length; an ambiguous natural-language phrase only flags on a short
+ * page (the length guard keeps false positives away from genuine postings).
+ *
+ * @param {string} text - Scraped page text.
+ * @returns {boolean}
+ */
+export function looksLikeBotWall(text) {
+  const normalized = String(text ?? '').toLowerCase();
+  if (!normalized.trim()) return false;
+  if (STRONG_BOT_WALL_MARKERS.some((marker) => normalized.includes(marker))) return true;
+  if (normalized.length > MAX_BOT_WALL_LENGTH) return false;
+  return AMBIGUOUS_BOT_WALL_MARKERS.some((marker) => normalized.includes(marker));
+}
+
 // ---------------------------------------------------------------------------
 // Health check endpoints
 // ---------------------------------------------------------------------------
@@ -266,6 +327,17 @@ async function runAsyncPipeline({ jdUrl, jdText, source, responseTarget, baseUrl
       const scraped = await scrapeJobDescription(jdUrl);
       finalJdText = scraped.text;
       pageTitle = scraped.title;
+
+      // The scraper can land on an anti-bot / "security verification" wall
+      // instead of the posting. That text is not a JD — evaluating it burns a
+      // Gemini call and yields a confusing "missing Block A…G" error. Detect it
+      // and fail fast with an actionable message.
+      if (looksLikeBotWall(finalJdText)) {
+        throw new Error(
+          'The job site returned a bot-protection / security-verification page instead of the posting. ' +
+          'Paste the job description text directly, or try a different link.',
+        );
+      }
     }
     
     if (!finalJdText || finalJdText.length < 100) {
