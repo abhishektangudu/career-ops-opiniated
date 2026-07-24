@@ -176,6 +176,7 @@ const scripts = [
   // Fork-only: Slack/Telegram remote-access server suites (HMAC verify, auth
   // routing, eval-args regression, scrape-jd parse/error paths).
   { name: 'server.test.mjs', expectExit: 0 },
+  { name: 'gemini-eval.test.mjs', expectExit: 0 },
   { name: 'scrape-jd.test.mjs', expectExit: 0 },
   { name: 'runtime-settings.test.mjs', expectExit: 0 },
   { name: 'verify-google-access.test.mjs', expectExit: 0 },

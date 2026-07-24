@@ -126,7 +126,13 @@ for (let i = 0; i < args.length; i++) {
     jdText = readFileSync(filePath, 'utf-8').trim();
   } else if (args[i] === '--model' && args[i + 1]) {
     modelName = args[++i];
-  } else if (args[i] === '--url' && args[i + 1]) {
+  } else if (args[i] === '--url') {
+    // Require a real value: a missing arg or another flag must not be swallowed
+    // (e.g. `--url --no-save` must not consume `--no-save` as the URL).
+    if (!args[i + 1] || args[i + 1].startsWith('--')) {
+      console.error('❌  --url requires a value (the source posting URL).');
+      process.exit(1);
+    }
     jdUrl = args[++i].trim();
   } else if (args[i] === '--no-save') {
     saveReport = false;
@@ -442,10 +448,10 @@ if (saveReport) {
     const reportContent = `# Evaluation: ${company} — ${role}
 
 **Date:** ${today}
-**URL:** ${jdUrl}
 **Archetype:** ${archetype}
 **Score:** ${score}/5
 **Legitimacy:** ${legitimacy}
+**URL:** ${jdUrl}
 **PDF:** pending
 **Tool:** Gemini (${modelName})
 
