@@ -90,6 +90,7 @@ if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
   OPTIONS
     --file <path>    Read JD from a file instead of inline text
     --model <name>   Gemini model to use (default: gemini-2.5-flash)
+    --url <url>      Source posting URL, recorded in the report header (not evaluated)
     --no-save        Do not save report to reports/ directory
     --help           Show this help
 
@@ -111,6 +112,9 @@ let jdText = '';
 // explicit --model below still wins over this.
 let modelName = resolveSetting('geminiModel', { root: ROOT }) || 'gemini-2.5-flash';
 let saveReport = true;
+// Source posting URL for the report header. Stored SEPARATELY from jdText so it
+// never pollutes the evaluated JD (any non-flag arg is treated as JD text).
+let jdUrl = '';
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--file' && args[i + 1]) {
@@ -122,6 +126,8 @@ for (let i = 0; i < args.length; i++) {
     jdText = readFileSync(filePath, 'utf-8').trim();
   } else if (args[i] === '--model' && args[i + 1]) {
     modelName = args[++i];
+  } else if (args[i] === '--url' && args[i + 1]) {
+    jdUrl = args[++i].trim();
   } else if (args[i] === '--no-save') {
     saveReport = false;
   } else if (!args[i].startsWith('--')) {
@@ -436,6 +442,7 @@ if (saveReport) {
     const reportContent = `# Evaluation: ${company} — ${role}
 
 **Date:** ${today}
+**URL:** ${jdUrl}
 **Archetype:** ${archetype}
 **Score:** ${score}/5
 **Legitimacy:** ${legitimacy}
